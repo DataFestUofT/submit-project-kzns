@@ -1,0 +1,338 @@
+```{r load library, message=FALSE}
+library(tidyverse)
+library(tsbox)
+library(xts)
+library(rugarch)
+library(tseries)
+library(anytime)
+library(aTSA) # adf.test
+library(COVID19)
+library(gamm4)
+library(MTS) # BEKK11
+library(rmgarch) # multivariate GARCH
+library(vars) # VAR, causality
+```
+
+## Load Data
+```{r load data}
+boston <- read.csv("https://data.boston.gov/dataset/6220d948-eae2-4e4b-8723-2dc8e67722a3/resource/12cb3883-56f5-47de-afa5-3b1cf61b257b/download/tmp6p2g5goi.csv")
+head(boston)
+
+# add date
+boston <- boston %>%
+  mutate(date = substr(OCCURRED_ON_DATE, start = 1, stop = 10))
+
+```
+
+
+## COVID 19 RELATED
+```{r covid 19 extract MA data}
+# extract MA data from US data. level 3 is by cities but cannot find Boston.
+covid19_MA <- covid19("USA", level = 2) %>%
+  filter(state == "Massachusetts") %>%
+  # filter out days when confirmed is zero
+  filter(confirmed > 0)
+
+# calculate the difference per day
+covid19_MA_diff <- data.frame(diff(covid19_MA$confirmed))
+colnames(covid19_MA_diff)[1] = "confirmed"
+covid19_MA_diff$date = covid19_MA$date[2:length(covid19_MA$date)]
+
+head(covid19_MA)
+
+```
+
+```{r covid 19 related exploration}
+# extract for tranforming into time series data
+ts_MA <- covid19_MA %>% 
+  dplyr::select(date, confirmed) %>%
+  ts_xts()
+
+# plot time series of MA infection
+ts_plot(ts_MA)
+# conduct ADF Test
+adf.test(as.ts(ts_MA))
+# not stationary at all
+
+# try first log difference
+ts_diff_MA <- diff(ts_MA)
+ts_plot(ts_diff_MA)
+# still clearly not stationary
+# need de-trend
+
+# de-trend 
+# GAMM model from STA303 A3
+
+# time as integer
+covid19_MA_diff$timeInt = as.numeric(covid19_MA_diff$date)
+# make a copy to avoid perfect collinearity
+covid19_MA_diff$timeIid = covid19_MA_diff$timeInt
+
+# GAMM model
+# 50 too overfit. 15 looks decent
+gamMA <- gamm4::gamm4(confirmed ~  s(timeInt, k=50), random = ~(1|timeIid), 
+	data=covid19_MA_diff, family=poisson(link='log'))
+
+lme4::VarCorr(gamMA$mer)
+# looks like random intercept is making little difference.
+# choose to not have random effect to preserve it for time series analysis
+
+# plot fitted value
+toPredict = data.frame(time = seq(covid19_MA_diff$date[1], 
+                                          covid19_MA_diff$date[length(covid19_MA_diff$date)],
+                                  by = '1 day'))
+toPredict$timeInt = as.numeric(toPredict$time)
+
+# plot
+
+matplot(toPredict$time, 
+        exp(do.call(cbind, mgcv::predict.gam(gamMA$gam, toPredict, se.fit=TRUE)) %*% 
+              Pmisc::ciMat()), 
+        col='black', lty=c(1,2,2), type='l', xaxt='n', xlab='', ylab='count', 
+        ylim = c(0.5, 5000), xlim = as.Date(c(covid19_MA$date[1], covid19_MA$date[length(covid19_MA$date)])))
+
+# obtain forecast
+forecast <- data.frame(exp(do.call(cbind, mgcv::predict.gam(gamMA$gam, toPredict, se.fit=TRUE))))
+                        
+                        
+# access residuals
+MA_res <- data.frame(covid19_MA_diff$confirmed - forecast$fit)
+
+# transform into time series
+MA_res$time = covid19_MA_diff$date
+colnames(MA_res)[1] = "residuals"
+
+col_order <- c("time", "residuals")
+MA_res <- MA_res[, col_order]
+
+MA_res_ts <- ts_xts(MA_res)
+
+plot.xts(MA_res_ts)
+# adf test
+adf.test(as.ts(MA_res_ts))
+# Stationary process
+# adf.test does not work on xts. needs to transform
+```
+
+
+## CRIME
+```{r non-plot exploration}
+# summary of all crime
+boston_summary <- boston %>%
+  group_by(OFFENSE_DESCRIPTION) %>%
+  summarise(number_of_crime = n()) %>%
+  arrange(desc(number_of_crime))
+
+boston_summary
+
+# count per month
+boston_monthly <- boston %>%
+  group_by(OFFENSE_DESCRIPTION, YEAR, MONTH) %>%
+  summarize(monthly_freq = n())
+
+# count per day
+boston_daily <- boston %>%
+  group_by(OFFENSE_DESCRIPTION, date) %>%
+  summarize(daily_frequ = n())
+
+```
+
+### Verbal Dispute
+```{r plot}
+# bar chart of 5 most frequent crime over the years
+boston %>%
+  filter(OFFENSE_DESCRIPTION %in% head(boston_summary$OFFENSE_DESCRIPTION, 5)) %>%
+  ggplot(aes(x=OFFENSE_DESCRIPTION)) +
+  geom_bar()
+
+# verbal dispute per month
+dispute <- boston_monthly %>%
+  ungroup() %>%
+  dplyr::select(OFFENSE_DESCRIPTION, YEAR, MONTH, monthly_freq) %>%
+  filter(OFFENSE_DESCRIPTION == "VERBAL DISPUTE")
+
+# construct time
+dates <- seq(as.Date("2015-06-01"), length = nrow(dispute), by = "months")
+dispute$time <- dates
+
+# reorder and select only interested columns
+col_order <- c("time", "monthly_freq")
+dispute_ts <- dispute[, col_order] %>%
+  # remove May 2020 due to incomplete info
+  head(-1) %>%
+  ts_ts() 
+
+
+
+# plot time series of investigate
+ts_plot(dispute_ts, title="Number of VERBAL DISPUTE cases per month in Boston")
+
+# stationary?
+adf.test(dispute_ts)
+# not stationary
+
+# try to detrend
+dispute_diff <- diff(dispute_ts)
+adf.test(dispute_diff)
+# stationary
+ts_plot(dispute_diff, title = "Change in the number of VERBAL DISPUTE cases per month in Boston")
+
+
+# plot daily version of verbal dispute
+dispute_daily <- boston_daily %>%
+  ungroup() %>%
+  filter(OFFENSE_DESCRIPTION == "VERBAL DISPUTE") %>%
+  dplyr::select(date, daily_frequ)
+
+colnames(dispute_daily)[1] <- 'time'
+
+dispute_xts <- ts_xts(dispute_daily)
+
+plot.xts(dispute_xts)
+
+# already stationary
+# no need to do first difference to obtain stationarity
+dispute_xts <- ts_xts(dispute_daily)
+# following two steps are unnecessary
+dispute_diff_xts <- na.omit(diff(dispute_xts))
+plot.xts(dispute_diff_xts["2020/"],
+         main = "Change in the number of verbal dispute
+         per day in Boston since 2020")
+
+# plot daily dispute from 2020
+plot.xts(dispute_xts["2020-01-01/"], main = "number of VERBAL DISPUTE per day in Boston since 2020")
+
+# plot daily dispute during covid 19
+plot.xts(dispute_xts[paste(start(MA_res_ts),end(dispute_diff_xts), sep = "/")],
+         main = "number of VERBAL DISPUTE per day
+         in Boston during COVID 19")
+
+# Year to Year comparison
+dispute_daily %>%
+  mutate(year = stringr::str_extract(time, "^.{4}"),
+         time_wo_year = stringr::str_sub(time, start = -5)) %>%
+  ggplot(aes(x = time_wo_year, y = daily_frequ, group = year, color = year)) +
+  geom_line() +
+  geom_point() +
+  ggtitle("Year to Year comparison of daily verbal dispute frequency in Boston")
+```
+
+```{r model building on boston crime}
+
+
+model_arma_garch <- ugarchspec(variance.model = list(model = 'sGARCH', garchOrder = c(1,1)),
+                           mean.model = list(armaOrder = c(1,0), include.mean = TRUE),
+                           distribution.model = 'norm')
+# build model using original data since it is stationary already
+dispute_var_fit <- ugarchfit(spec = model_arma_garch, data = dispute_xts)
+dispute_var_fit@fit$coef
+
+# obtain in-sample forecast
+dispute_forecast <- ugarchforecast(fit = dispute_var_fit, n.ahead = 20)
+
+# plot fit
+dates1 <- index(dispute_xts)
+t1 <- start(dispute_xts)
+dispute_fit_xts <- xts(dispute_forecast@model$modeldata$sigma, 
+                      start = t1, order.by = anytime(dates1))
+
+# plot fitted volatility
+plot.xts(dispute_fit_xts, grid.col = 'white',
+         col = 'darkblue', ylab = '')
+```
+
+
+
+## Multivariate
+### Volatility
+#### BEKK
+```{r BEKK model}
+# plot raw data
+# based on common range of time
+combined <- merge(dispute_xts[paste(start(MA_res_ts),end(dispute_xts), sep = "/")],
+                  ts_MA[paste(start(MA_res_ts),end(dispute_xts), sep = "/")])
+plot.xts(combined)
+
+
+# plot first difference of both
+# based on common range of time
+combined_diff <- merge(dispute_diff_xts[paste(start(MA_res_ts),end(dispute_diff_xts), sep = "/")],
+                  MA_res_ts[paste(start(MA_res_ts),end(dispute_diff_xts), sep = "/")])
+plot.xts(combined_diff)
+
+# fit a BEKK GARCH model
+BEKK <- BEKK11(combined_diff)
+```
+#### DCC
+```{r dynamic conditional correlation}
+# specify garch model
+# GARCH(1,1) for each
+garch11_sepc <- ugarchspec(mean.model = list(armaOrder = c(0, 0)),
+                           variance.model = list(garchOrder = c(1,1),
+                                                 model = 'sGARCH'), distribution.model = 'norm')
+
+# specify DCC spec
+# create 2 GARCH(1,1) for each of the two time series
+dcc_spec <- dccspec(uspec = multispec(replicate(2, garch11_sepc)),
+                    dccOrder = c(1,1), distribution = 'mvnorm')
+
+# fit daily change data into DCC model
+#dcc_fit <- dccfit(dcc_spec, data = combined)
+
+# currently doesn't work due to less than 100 variables
+# recommended to try BayesGARCH
+# looking for multivariate implementation of BayesGARCH
+```
+currently doesn't work due to less than 100 variables
+recommended to try BayesGARCH
+looking for multivariate implementation of BayesGARCH
+
+### Mean
+#### VAR
+```{r Vector Auto Regressive implementation}
+# range where covid and crime overlaps
+common_time <- seq.Date(as.Date(start(combined_diff)),
+                          as.Date(end(combined_diff)), 
+                          by="day")
+
+# examine two time series
+plotrix::twoord.plot(common_time, combined_diff$daily_frequ,
+                     common_time, combined_diff$residuals,
+                     type = c("l","l"),
+                     main = "Daily number of verbal dispute cases 
+                     and number of confirmed cases daily in Boston",
+                     xaxt = "n",
+                     ylab = "number of verbal dispute cases",
+                     rylab = "number of daily fluctuation of covid 19 cases")
+
+# VAR model estimation
+VAR_dispute <- VAR(y=combined_diff, p = 10)
+
+# Granger Causality test
+summary(VAR_dispute)
+causality(VAR_dispute, cause = "daily_frequ")
+causality(VAR_dispute, cause = "residuals")
+# prediction advantage from covid to dispute is highly significant
+
+# Impulse Response Function
+irf1 <- irf(VAR_dispute, impulse = "daily_frequ", response = "residuals", n.ahead = 24)
+plot(irf1, sub = "")
+
+irf2 <- irf(VAR_dispute, impulse = "residuals", response = "daily_frequ", n.ahead = 24)
+plot(irf2, sub = "")
+
+# shock both significant at around 7 days later
+
+# obtain forecast
+VAR_dispute_forecast <- predict(VAR_dispute, n.ahead = 24)
+par(mai = c(0.4,0.4,0.5,0.1), cex.main = 0.8)
+plot(VAR_dispute_forecast)
+
+# construct dispute AR(10) without help of coivd
+
+dispute_ar <- arima(as.ts(dispute_diff_xts), order = c(10,0,0))
+dispute_ar_forecast <- predict(dispute_ar, n.ahead = 24)
+ts.plot(dispute_ar_forecast$pred, 
+        gpars = list(col = "red"))
+
+```

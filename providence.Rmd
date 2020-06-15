@@ -1,0 +1,631 @@
+---
+title: "Providence"
+author: "Zhengkai Fu"
+date: "21/05/2020"
+output: pdf_document
+---
+
+```{r library, message = FALSE, warning = FALSE}
+library(RSocrata)
+library(tidyverse)
+library(tsbox) # transform data into time series
+library(xts)
+library(COVID19) # to get data about covid 19
+library(aTSA) # adf.test
+library(forecast) #ariRI model
+library(vars) #VAR and Causality
+library(dygraphs)
+library(plotly)
+```
+# COVID 19
+## Load COVID 19 data for RIssachusetts
+```{r covid 19 for RI}
+# extract RI data from US data. level 3 is by cities but cannot find Boston.
+covid19_RI <- covid19("USA", level = 2) %>%
+  filter(administrative_area_level_2 == "Rhode Island") %>%
+  # filter out days when confirmed is zero or one
+  # becasue when it was 1 for a very long time
+  filter(confirmed > 1)
+
+## March 07 has 140 confirmed case which is impossible.
+## Google shows that date had still 3 cumulative case
+## Manual adjustment on row 5
+covid19_RI$confirmed[5] = covid19_RI$confirmed[4]
+
+# brief display
+head(covid19_RI)
+```
+### Choice explained
+
+#### Scope of data
+
+The covid 19 data related to the whole state of RIssachusetts are chosen, because the auther believes that suburban area and capital city are closely related in the context of disease and crime. It is well known that in America most of the residential area, suburban or rual area, is separately identifiable from commercial zone, the cities. While the crime might have happened in the city of Boston, the suspects or victims might live outside of Boston.
+
+#### Confirmed cases instead of Death count
+
+Although the number of confirmed cases can largely be influenced by the testing policy of the local government, the psychological effects of seeing confirmed cases alone might be enough to have some psychological relationship with committing crimes, which is what the author would like to explore.
+
+## Overview of the data
+### Visualization
+```{r overview of covid, message=FALSE}
+# plot cumulative cases
+# extract for transforming into time series data
+ts_RI <- covid19_RI %>% 
+  dplyr::select(date, confirmed) %>%
+  ts_xts()
+
+plot.xts(ts_RI,
+         main = "Cumulative confirmed cases 
+         of COVID19 in Rhode Island")
+
+# plot daily cases
+# first difference
+ts_diff_RI <- diff(ts_RI)
+
+# since the end goal is to get residuals
+# can add 2 to all values so that there is no negative value
+# while having residuals unchanged
+adj_diff_RI <- na.omit(ts_diff_RI[,1] + 2)
+
+plot.xts(ts_diff_RI,
+         main = "Daily confirmed cases of
+         COVID19 in Rhode Island")
+```
+
+As shown above, cumulative cases and daily cases have been plotted above.
+
+### Model the infection
+#### Construct the model
+```{r GAMM model for covid}
+# construct GAMM model from prof. Brown's work
+
+# construct data frame of difference, not time series
+covid19_RI_diff <- data.frame(diff(covid19_RI$confirmed) + 2)
+  
+colnames(covid19_RI_diff)[1] = "confirmed"
+covid19_RI_diff$date = covid19_RI$date[2:length(covid19_RI$date)]
+
+# time as integer
+covid19_RI_diff$timeInt = as.numeric(covid19_RI_diff$date)
+# RIke a copy to avoid perfect collinearity for mixed effect
+covid19_RI_diff$timeIid = covid19_RI_diff$timeInt
+
+# GAMM model
+gamRI <- gamm4::gamm4(confirmed ~ s(timeInt, k = 70), 
+                      random = ~(1|timeIid),
+                      data = covid19_RI_diff,
+                      family = poisson(link = 'log'))
+# currently 70 is the max due to length of data
+```
+
+In order to study covid19's impact on Boston, its trend needs to be modeled first to have a better understanding of the situation. A Generalized Additive Mixed Model is used here, which is a direct copy from prof. Patrick Brown's work in STA303 Assignment 3.
+
+#### Visuzalization of the model
+```{r plot GAMM}
+# plot fitted value
+toPredict = data.frame(time = seq(covid19_RI_diff$date[1], 
+                                          covid19_RI_diff$date[length(covid19_RI_diff$date)],
+                                  by = '1 day'))
+toPredict$timeInt = as.numeric(toPredict$time)
+
+# plot
+
+matplot(toPredict$time, 
+        exp(do.call(cbind, mgcv::predict.gam(gamRI$gam, toPredict, se.fit=TRUE)) %*% 
+              Pmisc::ciMat()), 
+        col='red', lty=c(1,2,2), type='l', xaxt='n', xlab='', ylab='Daliy Confirmed cases', 
+        ylim = c(0.5, 800), xlim = as.Date(c(covid19_RI$date[1], covid19_RI$date[length(covid19_RI$date)])))
+title("Daily confirmed cases of COVID 19 in Boston")
+
+matpoints(toPredict$time, covid19_RI_diff$confirmed, 
+          col = 'black',
+          type = 'l')
+
+trend <- data.frame(exp(do.call(cbind, mgcv::predict.gam(gamRI$gam, toPredict, se.fit=TRUE)) %*% Pmisc::ciMat()))
+
+providence_covid <- ggplot(trend, aes(x=toPredict$time)) +
+  geom_line(aes(y=est), color = "red") +
+  geom_line(aes(y=X.2.5), color = "red", linetype = "dashed") +
+  geom_line(aes(y=X97.5), color = "red", linetype = "dashed") +
+  geom_area(aes(y=covid19_RI_diff$confirmed), alpha = 0.4) +
+  ylab("Daliy Confirmed cases") +
+  xlab("Date") +
+  theme_classic()
+
+providence_covid
+
+ggplotly(providence_covid)
+```
+The overall trend of the covid 19 infection in Boston is successfully modeled and displayed above, including a 95% confidence interval. However, those are not very important. Now let's take a look at crime situation in Boston.
+
+#### Obtain the residuals
+```{r covid 19 residual}
+# obtain forecast
+forecast_covid <- data.frame(exp(do.call(cbind, mgcv::predict.gam(gamRI$gam, toPredict, se.fit=TRUE))))
+                        
+                        
+# access residuals
+RI_res <- data.frame(covid19_RI_diff$confirmed - forecast_covid$fit)
+
+# transform into time series
+RI_res$time = covid19_RI_diff$date
+colnames(RI_res)[1] = "residuals"
+
+col_order <- c("time", "residuals")
+RI_res <- RI_res[, col_order]
+
+RI_res_ts <- ts_xts(RI_res)
+
+plot.xts(RI_res_ts,
+         main = "Daily fluctuation of COVID 19 confirmd cases
+         in RI outside its overall trend")
+# adf test
+adf.test(as.ts(RI_res_ts))
+```
+
+The residuals obtained here represents the fluctuation of daily confirmed cases of COVID 19 in providence, in order to obtain a stationary time series for future analysis. This residuals can otherwise be interpreted as "fluctuation outside the new norm".
+# Providence Crime
+## Load crime data
+```{r get Providence data}
+providence <- read.socrata(
+  "https://data.providenceri.gov/resource/rz3y-pz8v.csv",
+  app_token = "hPU78MH7zKApdpUv4OVCInPOQ")
+
+head(providence)
+
+# add date
+providence <- providence %>%
+  mutate(date = substr(reported_date, start = 1, stop = 10)) %>%
+  mutate(y_month  = substr(reported_date, start = 1, stop = 7))
+
+# extract most vague name of crime
+providence <- providence %>%
+  separate(offense_desc, c("crime", "detail_crime"), sep = ",")
+
+```
+
+## Overview of crime
+```{r summary}
+# summary of all crime
+providence_summary <- providence %>%
+  group_by(crime) %>%
+  summarise(number_of_crime = n()) %>%
+  arrange(desc(number_of_crime))
+
+providence_summary
+
+providence %>%
+  filter(crime %in% head(providence_summary$crime, 5)) %>%
+  ggplot(aes(x=crime)) +
+  geom_bar()
+
+# top 5 crime over time
+# monthly
+# not too many months anyways
+providence %>%
+  dplyr::select(y_month, crime) %>%
+  filter(crime %in% head(providence_summary$crime, 5)) %>% 
+  count(y_month, crime) %>%
+  ggplot(aes(y_month, n, group = crime, color = crime)) +
+  geom_line() + 
+  scale_fill_brewer(palette = "Set1", breaks = rev(levels(providence_summary$crime[1:5]))) +
+  ggtitle("Frequency of top 5 crime in Providence")
+
+# daily
+daily <- providence %>%
+  dplyr::select(date, crime) %>%
+  filter(crime %in% head(providence_summary$crime, 5)) %>% 
+  count(date, crime) %>%
+  ggplot(aes(date, n, group = crime, color = crime)) +
+  geom_line() + 
+  facet_free(~crime) +
+  scale_fill_brewer(palette = "Set1", breaks = rev(levels(providence_summary$crime[1:5]))) +
+  ggtitle("Daily requency of top 5 crime in Providence in the past 180 days") +
+  theme(legend.position = "none")
+
+ggplotly(daily)
+
+# no year to year comparison since only 180 days are provided
+```
+
+
+## VAR for top 5 crime
+### Step 1: Extract cases
+```{r extract cases}
+# extract top 5 cases
+top5crime <- providence %>%
+  filter(crime %in% head(providence_summary$crime,5)) %>%
+  group_by(date, crime) %>%
+  tally() %>%
+  spread(crime, n)
+
+# replace NA with 0
+top5crime[is.na(top5crime)] = 0
+
+# rename columns
+colnames(top5crime) <- c("time",
+                         "assault",
+                         "larceny",
+                         "larceny_from_vehicle",
+                         "missing",
+                         "vandalism")
+
+# create date
+top5crime$time <- as.Date(top5crime$time,
+                          format = "%Y-%m-%d")
+
+# create time series
+top5crime_xts <- ts_xts(top5crime[,1:2])
+
+for (i in (3:ncol(top5crime))){
+  temp_xts <- ts_xts(top5crime[, c(1,i)])
+  top5crime_xts <- merge(top5crime_xts, temp_xts)
+}
+
+# extract difference, change per day
+top5crime_diff <- na.omit(diff(top5crime_xts))
+```
+
+### Step 2: Construct combined time series
+```{r top 5 crime VAR}
+# specify common time range
+# start from when covid was a thing
+# end with 1 day before today's date
+common_time <- seq.Date(start(RI_res_ts), as.Date("2020-05-25") , by = "day")
+
+# combine time series of crime and covid
+combined_diff <- merge(top5crime_diff[paste(common_time[1],
+                                            common_time[length(common_time)],
+                                            sep = "/")],
+                       RI_res_ts[paste(common_time[1],
+                                            common_time[length(common_time)],
+                                            sep = "/")])
+
+```
+
+### Step 3: Plot each crime with covid
+```{r plot together}
+for (i in 1:(ncol(combined_diff) - 1)){
+  plotrix::twoord.plot(common_time,
+                       combined_diff[,i],
+                       common_time,
+                       combined_diff$residuals,
+                       type = c("l","l"),
+                       xaxt = "n",
+                       rylab = "number of daily fluctuation of covid 19 cases",
+                       ylab = paste("daily change in", colnames(combined_diff)[i]))
+                       
+}
+```
+
+Many look very promising
+
+### Step 5: Construct VAR model
+```{r construct var, warning = FALSE}
+# variable selection based on AIC
+optimal_assault <- VARselect(combined_diff[,c(1,6)], type = 'none', lag.max = 10)
+optimal_larceny <- VARselect(combined_diff[,c(2,6)], type = 'none', lag.max = 10)
+optimal_vehicle <- VARselect(combined_diff[,c(3,6)], type = 'none', lag.max = 10)
+optimal_missing <- VARselect(combined_diff[,c(4,6)], type = 'none', lag.max = 10)
+optimal_vandalism <- VARselect(combined_diff[,c(5,6)], type = 'none', lag.max = 10)
+
+# use AIC as selection criteria
+VAR_assault <- VAR(y=as.ts(combined_diff[,c(1,6)]), p=optimal_assault$selection[1])
+VAR_larceny <- VAR(y=as.ts(combined_diff[,c(2,6)]), p=optimal_larceny$selection[1])
+VAR_vehicle <- VAR(y=as.ts(combined_diff[,c(3,6)]), p=optimal_vehicle$selection[1])
+VAR_missing <- VAR(y=as.ts(combined_diff[,c(4,6)]), p=optimal_missing$selection[1])
+VAR_vandalism <- VAR(y=as.ts(combined_diff[,c(5,6)]), p=optimal_vandalism$selection[1])
+```
+
+### Step 6: Granger Causality test
+#### ASSAULT
+```{r granger assault, warning=FALSE}
+causality(VAR_assault, cause = colnames(combined_diff)[1])
+causality(VAR_assault, cause = "residuals")
+```
+Covid significant to assault. 0.01
+
+#### LARCENY
+```{r granger larceny, warning=FALSE}
+causality(VAR_larceny, cause = colnames(combined_diff)[2])
+causality(VAR_larceny, cause = "residuals")
+```
+Nothing significant
+
+#### LARCENY FROM VEHICLE
+```{r granger vehicle, warning=FALSE}
+causality(VAR_vehicle, cause = colnames(combined_diff)[3])
+causality(VAR_vehicle, cause = "residuals")
+```
+
+Larceny from vehicle significant to covid.
+covid significant to larceny from vehicle, weak.
+
+#### MISSING
+```{r granger missing, warning=FALSE}
+causality(VAR_missing, cause = colnames(combined_diff)[4])
+causality(VAR_missing, cause = "residuals")
+```
+covid significant to missing. (0.04)
+
+#### VANDALISM
+```{r granger vandalism, warning=FALSE}
+causality(VAR_vandalism, cause = colnames(combined_diff)[5])
+causality(VAR_vandalism, cause = "residuals")
+```
+vandalism significant to covid.
+
+### Step 7: Impulse Response Function
+
+Only larceny from vechile significant
+```{r irf}
+par(mfrow = c(1,2))
+# larceny from vehicle
+irf_vehicle1 <- irf(VAR_vehicle,
+                    impulse = "larceny_from_vehicle",
+                    response = "residuals",
+                    n.ahead = 24)
+irf_vehicle2 <- irf(VAR_vehicle,
+                    impulse = "residuals",
+                    response = "larceny_from_vehicle",
+                    n.ahead = 24)
+
+# ggplot version of irf
+lags = c(1:25)
+
+irf_vehicle_1_gg <- data.frame(irf_vehicle1$irf$larceny_from_vehicle[,1],
+                   irf_vehicle1$Lower$larceny_from_vehicle[,1],
+                   irf_vehicle1$Upper$larceny_from_vehicle[,1])
+
+colnames(irf_vehicle_1_gg) <- c("mean", "lower", "upper")
+
+irf_vechile_1_plot <- ggplot(irf_vehicle_1_gg, aes(x = lags)) +
+  geom_line(aes(y = mean), color = "black") +
+  geom_hline(yintercept = 0, color = "blue") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "lightblue", alpha = 0.5) +
+  theme_classic() +
+  ggtitle("How many more daily covid19 cases there will be 
+          after 1 larceny from vehicle") +
+  xlab("Number of days after a larceny from vehicle")+
+  ylab("Number of new covid 19 cases")
+
+
+irf_vehicle_2_gg <- data.frame(irf_vehicle2$irf$residuals[,1],
+                              irf_vehicle2$Lower$residuals[,1],
+                              irf_vehicle2$Upper$residuals[,1])
+
+colnames(irf_vehicle_2_gg) <- c("mean", "lower", "upper")
+
+irf_vechile_2_plot <- ggplot(irf_vehicle_2_gg, aes(x = lags)) +
+  geom_line(aes(y = mean), color = "black") +
+  #geom_line(aes(y = upper), color = "red", linetype = "dashed") +
+  #geom_line(aes(y = lower), color = "red", linetype = "dashed") +
+  geom_hline(yintercept = 0, color = "blue") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "lightblue", alpha = 0.5) +
+  theme_classic() +
+  ggtitle("How many more larceny from vechile cases per day there will be 
+          after 1 confirmed covid19 case") +
+  xlab("Number of days after a confimed covid 19 case")+
+  ylab("Number of larceny from vechile")
+# this one not really significant at a bit above 0.05 and the impact is not even -1.0. So could be okay to leave this out as well.
+
+
+# html version
+# from crime to covid
+ggplotly(irf_vechile_1_plot)
+# from covid to crime
+ggplotly(irf_vechile_2_plot)
+
+# covid significant to assault
+irf_assault_1 <- irf(VAR_assault,
+                     impulse = "residuals",
+                     response = "assault",
+                     n.ahead = 24)
+
+irf_assault_1_gg <- data.frame(irf_assault_1$irf$residuals[,1],
+                               irf_assault_1$Lower$residuals[,1],
+                               irf_assault_1$Upper$residuals[,1])
+
+colnames(irf_assault_1_gg) <- c("mean", "lower", "upper")
+
+irf_assault_1_plot <- ggplot(irf_assault_1_gg, aes(x=lags)) +
+  geom_line(aes(y = mean), color = "black") +
+  geom_hline(yintercept = 0, color = "blue") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "lightblue", alpha = 0.5) +
+  theme_classic() +
+  ggtitle("How many more assault cases per day there will be 
+          after 1 confirmed covid19 case") +
+  xlab("Number of days after a confimed covid 19 case") +
+  ylab("Number of assault cases")
+
+ggplotly(irf_assault_1_plot)
+
+# vandalism significant to covid
+irf_vandalism_1 <- irf(VAR_vandalism,
+                       impulse = "vandalism",
+                     response = "residuals",
+                     n.ahead = 24)
+
+# ggplot version
+irf_vandalism_1_gg <- data.frame(irf_vandalism_1$irf$vandalism[,1],
+                                 irf_vandalism_1$Lower$vandalism[,1],
+                                 irf_vandalism_1$Upper$vandalism[,1])
+
+colnames(irf_vandalism_1_gg) <- c("mean", "lower", "upper")
+
+irf_vandalism_1_plot <- ggplot(irf_vandalism_1_gg, aes(x = lags)) +
+  geom_line(aes(y = mean), color = "black") +
+  geom_hline(yintercept = 0, color = "blue") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "lightblue", alpha = 0.5) +
+  theme_classic() +
+  ggtitle("How many more daily covid19 cases there will be 
+          after 1 vandalism") +
+  xlab("Number of days after a vandalism")+
+  ylab("Number of new covid 19 cases")
+
+ggplotly(irf_vandalism_1_plot)
+
+# covid significant to missing
+irf_missing_1 <- irf(VAR_missing,
+                     impulse = "residuals",
+                     response = "missing",
+                     n.ahead = 24)
+
+irf_missing_1_gg <- data.frame(irf_missing_1$irf$residuals[,1],
+                               irf_missing_1$Lower$residuals[,1],
+                               irf_missing_1$Upper$residuals[,1])
+
+colnames(irf_missing_1_gg) <- c("mean", "lower", "upper")
+
+irf_missing_1_plot <- ggplot(irf_missing_1_gg, aes(x=lags)) +
+  geom_line(aes(y = mean), color = "black") +
+  geom_hline(yintercept = 0, color = "blue") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "lightblue", alpha = 0.5) +
+  theme_classic() +
+  ggtitle("How many more missing person cases per day there will be 
+          after 1 confirmed covid19 case") +
+  xlab("Number of days after a confimed covid 19 case") +
+  ylab("Number of missing person cases")
+
+ggplotly(irf_missing_1_plot)
+```
+
+### Step 8: Forecast
+```{r custom function}
+interval_value_formatter <- "function(num, opts, seriesName, g, row, col) {
+  value = g.getValue(row, col);
+  if(value[0] != value[2]) {
+    lower = Dygraph.numberValueFormatter(value[0], opts);
+    upper = Dygraph.numberValueFormatter(value[2], opts);
+    return '[' + lower + ', ' + upper + ']';
+  } else {
+    return Dygraph.numberValueFormatter(num, opts);
+  }
+}"
+```
+```{r var forecast}
+forecast <- forecast(VAR_vehicle)
+
+autoplot(forecast$forecast$larceny_from_vehicle) +
+  ggtitle("Prediction on how many more larceny from vehicle cases compared to yesterday") +
+  theme_classic() +
+  ylab("Day-to-day change") +
+  xlab(paste("Numebr of days since", common_time[1]))
+
+autoplot(forecast$forecast$residuals) +
+  ggtitle("Prediction on how many more covid19 cases
+          with the help of larceny from vehicle record") +
+  theme_classic() +
+  ylab("Daily additional confirmed number") +
+  xlab(paste("Numebr of days since", common_time[1]))
+
+# assault
+# significant
+forecast_assault <- forecast(VAR_assault)
+
+forecast_assault$forecast$assault %>%
+  {cbind(actuals = .$x, forecast_mean=.$mean,
+         lower_95=.$lower[,"95%"], upper_95=.$upper[,"95%"],
+         lower_80=.$lower[,"80%"], upper_80=.$upper[,"80%"])} %>%
+  dygraph(main = "Daily forecast for day-to-day change in assault cases in Providence",
+          ylab = "Day-to-day change") %>%
+  dyAxis("y", valueFormatter = interval_value_formatter) %>%
+  dySeries("actuals", color = "black") %>%
+  dySeries("forecast_mean", color = "blue", label = "forecast") %>%
+  dySeries(c("lower_80", "forecast_mean", "upper_80"),
+           label = "80%", color = "blue") %>%
+  dySeries(c("lower_95", "forecast_mean", "upper_95"),
+           label = "95%", color = "blue")%>%
+  dyLegend(labelsSeparateLines=TRUE) %>%
+  dyRangeSelector() %>%
+  dyAxis("x", label = paste("Numebr of days since", common_time[1])) %>%
+  dyLegend(show = "follow")
+
+# larceny
+# not significant to larceny
+forecast_larceny <- forecast(VAR_larceny)
+
+forecast_larceny$forecast$larceny %>%
+  {cbind(actuals = .$x, forecast_mean=.$mean,
+         lower_95=.$lower[,"95%"], upper_95=.$upper[,"95%"],
+         lower_80=.$lower[,"80%"], upper_80=.$upper[,"80%"])} %>%
+  dygraph(main = "Daily forecast for day-to-day change in larceny cases in Providence",
+          ylab = "Day-to-day change") %>%
+  dyAxis("y", valueFormatter = interval_value_formatter) %>%
+  dySeries("actuals", color = "black") %>%
+  dySeries("forecast_mean", color = "blue", label = "forecast") %>%
+  dySeries(c("lower_80", "forecast_mean", "upper_80"),
+           label = "80%", color = "blue") %>%
+  dySeries(c("lower_95", "forecast_mean", "upper_95"),
+           label = "95%", color = "blue")%>%
+  dyLegend(labelsSeparateLines=TRUE) %>%
+  dyRangeSelector() %>%
+  dyAxis("x", label = paste("Numebr of days since", common_time[1])) %>%
+  dyLegend(show = "follow")
+
+# larceny from vehicle
+# not significant
+forecast_vehicle <- forecast(VAR_vehicle)
+
+forecast_vehicle$forecast$larceny_from_vehicle %>%
+  {cbind(actuals = .$x, forecast_mean=.$mean,
+         lower_95=.$lower[,"95%"], upper_95=.$upper[,"95%"],
+         lower_80=.$lower[,"80%"], upper_80=.$upper[,"80%"])} %>%
+  dygraph(main = "Daily forecast for day-to-day change in larceny from vechile cases in Providence",
+          ylab = "Day-to-day change") %>%
+  dyAxis("y", valueFormatter = interval_value_formatter) %>%
+  dySeries("actuals", color = "black") %>%
+  dySeries("forecast_mean", color = "blue", label = "forecast") %>%
+  dySeries(c("lower_80", "forecast_mean", "upper_80"),
+           label = "80%", color = "blue") %>%
+  dySeries(c("lower_95", "forecast_mean", "upper_95"),
+           label = "95%", color = "blue")%>%
+  dyLegend(labelsSeparateLines=TRUE) %>%
+  dyRangeSelector() %>%
+  dyAxis("x", label = paste("Numebr of days since", common_time[1])) %>%
+  dyLegend(show = "follow")
+
+# missing person
+# significant
+forecast_missing <- forecast(VAR_missing)
+
+forecast_missing$forecast$missing %>%
+  {cbind(actuals = .$x, forecast_mean=.$mean,
+         lower_95=.$lower[,"95%"], upper_95=.$upper[,"95%"],
+         lower_80=.$lower[,"80%"], upper_80=.$upper[,"80%"])} %>%
+  dygraph(main = "Daily forecast for day-to-day change in missing person cases in Providence",
+          ylab = "Day-to-day change") %>%
+  dyAxis("y", valueFormatter = interval_value_formatter) %>%
+  dySeries("actuals", color = "black") %>%
+  dySeries("forecast_mean", color = "blue", label = "forecast") %>%
+  dySeries(c("lower_80", "forecast_mean", "upper_80"),
+           label = "80%", color = "blue") %>%
+  dySeries(c("lower_95", "forecast_mean", "upper_95"),
+           label = "95%", color = "blue")%>%
+  dyLegend(labelsSeparateLines=TRUE) %>%
+  dyRangeSelector() %>%
+  dyAxis("x", label = paste("Numebr of days since", common_time[1])) %>%
+  dyLegend(show = "follow")
+
+# vandalism
+# covid not significant to vandalism
+forecast_vandalism <- forecast(VAR_vandalism)
+
+forecast_vandalism$forecast$vandalism %>%
+  {cbind(actuals = .$x, forecast_mean=.$mean,
+         lower_95=.$lower[,"95%"], upper_95=.$upper[,"95%"],
+         lower_80=.$lower[,"80%"], upper_80=.$upper[,"80%"])} %>%
+  dygraph(main = "Daily forecast for day-to-day change in vandalism cases in Providence",
+          ylab = "Day-to-day change") %>%
+  dyAxis("y", valueFormatter = interval_value_formatter) %>%
+  dySeries("actuals", color = "black") %>%
+  dySeries("forecast_mean", color = "blue", label = "forecast") %>%
+  dySeries(c("lower_80", "forecast_mean", "upper_80"),
+           label = "80%", color = "blue") %>%
+  dySeries(c("lower_95", "forecast_mean", "upper_95"),
+           label = "95%", color = "blue")%>%
+  dyLegend(labelsSeparateLines=TRUE) %>%
+  dyRangeSelector() %>%
+  dyAxis("x", label = paste("Numebr of days since", common_time[1])) %>%
+  dyLegend(show = "follow")
+```

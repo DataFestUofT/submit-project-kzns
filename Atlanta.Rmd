@@ -1,0 +1,441 @@
+---
+title: "atlanta"
+output: pdf_document
+---
+```{r library, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(tseries)
+library(tsbox) # transform data into time series
+library(xts)
+library(COVID19) # to get data about covid 19
+library(forecast) #arima model
+library(vars) #VAR and Causality
+library(dplyr)
+library(dygraphs)
+library(plotly)
+```
+
+```{r covid 19 for Atlanta region}
+covid19_AT <- covid19("USA", level = 3) %>%
+  filter(administrative_area_level_2 == "Georgia",
+         administrative_area_level_3 == 'Fulton') %>%
+  # filter out days when confirmed is zero or one
+  # becasue when it was 2 for a very long time
+  filter(confirmed > 2)
+
+# brief display
+head(covid19_AT)
+```
+
+
+```{r get Atlanta data, 2014-2020}
+# webpage: https://www.atlantapd.org/i-want-to/crime-data-downloads
+# download the compressed files
+# file link: https://www.atlantapd.org/Home/ShowDocument?id=3279
+# https://www.atlantapd.org/Home/ShowDocument?id=3051
+# notice: the file link would also be changing with the system updates once a week
+
+# download 2020 file
+url1 <- 'https://www.atlantapd.org/Home/ShowDocument?id=3279'
+temp <- tempfile()
+download.file(url1, temp, mode = 'wb')
+zip_data1 <- read.csv(unz(temp, 'COBRA-2020.csv'))
+unlink(temp)
+
+# download historical data before 2020
+url2 <- 'https://www.atlantapd.org/Home/ShowDocument?id=3051'
+temp <- tempfile()
+download.file(url2, temp, mode = 'wb')
+zip_data2 <- read.csv(unz(temp, 'COBRA-2009-2019.csv'))
+unlink(temp)
+
+zip_data2 <- zip_data2 %>%
+  filter(substr(Occur.Date, start = 1, stop = 4) >= '2014')
+```
+
+```{r}
+library(lubridate)
+zip_data1$occur_date <- format(as.Date(zip_data1$occur_date, "%m/%d/%Y"), '%Y-%m-%d')
+
+zip_data2$UCR.Literal <- gsub('ROBBERY-COMMERCIAL', 'ROBBERY', zip_data2$UCR.Literal)
+zip_data2$UCR.Literal <- gsub('ROBBERY-PEDESTRIAN', 'ROBBERY', zip_data2$UCR.Literal)
+zip_data2$UCR.Literal <- gsub('ROBBERY-RESIDENCE', 'ROBBERY', zip_data2$UCR.Literal)
+zip_data2$UCR.Literal <- gsub('BURGLARY-RESIDENCE', 'BURGLARY', zip_data2$UCR.Literal)
+zip_data2$UCR.Literal <- gsub('BURGLARY-NONRES', 'BURGLARY', zip_data2$UCR.Literal)
+zip_data2$UCR.Literal <- gsub('LARCENY-FROM VEHICLE', 'LARCENY', zip_data2$UCR.Literal)
+zip_data2$UCR.Literal <- gsub('LARCENY-NON VEHICLE', 'LARCENY', zip_data2$UCR.Literal)
+
+colnames(zip_data1) <- c("Report.Number", "Report.Date", "Occur.Date", "Occur.Time", "Possible.Date", "Possible.Time","Beat","Apartment.Office.Prefix","Apartment.Number","Location","MinOfucr","dispo_code","Shift.Occurence","Location.Type","UCR.Literal","IBR.Code","Neighborhood", "NPU", "Latitude","Longitude")
+
+atlanta <- merge(zip_data1,zip_data2, all = T)
+
+# add date
+atlanta <- atlanta %>%
+  mutate(y_month  = substr(Occur.Date, start = 1, stop = 7)) %>%
+  mutate(YEAR  = substr(Occur.Date, start = 1, stop = 4)) %>%
+  mutate(MONTH = substr(Occur.Date, start = 6, stop = 7))
+```
+
+```{r}
+# summary of all crime
+atlanta_summary <- atlanta %>%
+  group_by(UCR.Literal) %>%
+  summarise(number_of_crime = n()) %>%
+  arrange(desc(number_of_crime))
+
+# bar chart
+# 6 crimes in total
+atlanta %>%
+  filter(UCR.Literal %in% head(atlanta_summary$UCR.Literal, 5)) %>%
+  ggplot(aes(x=UCR.Literal, fill=UCR.Literal)) +
+  geom_bar(width = 0.5) +
+  coord_flip() +
+  theme_classic() +
+  labs(y='Number of Crimes',x='Offense Description')
+
+# per MONTH
+atlanta %>%
+  dplyr::select(MONTH, UCR.Literal, YEAR, y_month) %>%
+  filter(UCR.Literal %in% atlanta_summary$UCR.Literal[1:6],YEAR == '2020', y_month != "2020-06") %>% 
+  count(MONTH, UCR.Literal) %>%
+  na.omit() %>%
+  ggplot(aes(MONTH, n, group = UCR.Literal, color = UCR.Literal)) +
+  geom_line() +
+  scale_color_brewer(palette = "Set1") +
+  ggtitle("Monthly frequency of top 5 crime in Atlanta in 2020")
+
+# This dataset doesn't have 'day of the week' yet.
+
+# daily 2020
+atlanta %>%
+  dplyr::select(Occur.Date, UCR.Literal, YEAR) %>%
+  filter(UCR.Literal %in% atlanta_summary$UCR.Literal[1:5], YEAR=='2020') %>%
+  count(Occur.Date, UCR.Literal) %>%
+  ggplot(aes(Occur.Date, n, group = UCR.Literal, color = UCR.Literal)) +
+  geom_line() +
+  facet_wrap(~UCR.Literal) +
+  scale_fill_brewer(palette = "Set1", breaks = rev(levels(atlanta_summary$UCR.Literal[1:5]))) +
+  ggtitle("Frequency of top 5 crime in Atlanta in 2020")
+
+# year to year comparison
+atlanta %>%
+  dplyr::select(y_month, MONTH, UCR.Literal, YEAR) %>%
+  filter(UCR.Literal %in% atlanta_summary$UCR.Literal[1:5], y_month != "2020-06") %>%
+  count(YEAR, MONTH, UCR.Literal) %>%
+  na.omit() %>%
+  ggplot(aes(x=MONTH, y=n, group = YEAR, color = as.character(YEAR))) +
+  geom_line() +
+  facet_wrap(~UCR.Literal) +
+  guides(color = guide_legend(reverse = TRUE)) +
+  ggtitle("year to year comparison of the top 5 crime in Atlanta in the past 6 years") +
+  xlab('Month') +
+  ylab('Cases') +
+  labs(col='Year')
+
+```
+
+## VAR 
+### Step1 : Extract cases
+```{r extract cases}
+# extract all crimes
+top5crime <- atlanta %>%
+  filter(UCR.Literal %in% head(atlanta_summary$UCR.Literal, 5)) %>%
+  group_by(Occur.Date, UCR.Literal) %>%
+  tally() %>%
+  spread(UCR.Literal, n)
+
+top5crime[is.na(top5crime)] = 0
+
+# rename columns
+colnames(top5crime) <- c('time',
+                         'assault',
+                         "autotheft",
+                         "burglary",
+                         "larceny",
+                         'robbery')
+
+# create time series
+top5crime_xts <- ts_xts(top5crime[,1:2])
+
+for (i in (3:ncol(top5crime))){
+  temp_xts <- ts_xts(top5crime[, c(1,i)])
+  top5crime_xts <- merge(top5crime_xts, temp_xts)
+}
+
+# extract difference, change per day
+top5crime_diff <- na.omit(diff(top5crime_xts))
+```
+
+### Step 2: Construct combined time series
+```{r top 5 crime VAR}
+# extract for tranforming into time series data
+ts_AT <- covid19_AT %>% 
+  dplyr::select(date, confirmed) %>%
+  ts_xts()
+
+# try first log difference
+ts_diff_AT <- diff(ts_AT)
+
+adj_diff_AT <- na.omit(ts_diff_AT[,1] + 10)
+covid19_AT_diff <- data.frame(diff(covid19_AT$confirmed) + 10)
+
+colnames(covid19_AT_diff)[1] = "confirmed"
+covid19_AT_diff$date = covid19_AT$date[2:length(covid19_AT$date)]
+
+# time as integer
+covid19_AT_diff$timeInt = as.numeric(covid19_AT_diff$date)
+# make a copy to avoid perfect collinearity
+covid19_AT_diff$timeIid = covid19_AT_diff$timeInt
+
+# GAMM model
+# 50 too overfit. 15 looks decent
+gamAT <- gamm4::gamm4(confirmed ~  s(timeInt, k=90), random = ~(1|timeIid), 
+                      data=covid19_AT_diff, family=poisson(link='log'))
+
+# looks like random intercept is making little difference.
+# choose to not have random effect to preserve it for time series analysis
+
+# plot fitted value
+toPredict = data.frame(time = seq(covid19_AT_diff$date[1], 
+                                  covid19_AT_diff$date[length(covid19_AT_diff$date)],
+                                  by = '1 day'))
+toPredict$timeInt = as.numeric(toPredict$time)
+
+# obtain forecast
+forecast <- data.frame(exp(do.call(cbind, mgcv::predict.gam(gamAT$gam, toPredict, se.fit=TRUE))))
+
+# access residuals
+AT_res <- data.frame(covid19_AT_diff$confirmed - forecast$fit)
+
+# transform into time series
+AT_res$time = covid19_AT_diff$date
+colnames(AT_res)[1] = "residuals"
+
+col_order <- c("time", "residuals")
+AT_res <- AT_res[, col_order]
+
+AT_res_ts <- ts_xts(AT_res)
+# specify common time range
+# start from when covid was a thing
+# end with 1 day before today's date
+common_time <- seq.Date(start(AT_res_ts), as.Date("2020-05-25"), by = "day")
+
+# combine time series of crime and covid
+combined_diff <- merge(top5crime_diff[paste(common_time[1],
+                                            common_time[length(common_time)],
+                                            sep = "/")],
+                       AT_res_ts[paste(common_time[1],
+                                            common_time[length(common_time)],
+                                            sep = "/")])
+
+```
+
+### Step 3: Plot each crime with covid
+```{r plot together}
+for (i in 1:(ncol(combined_diff) - 1)){
+  plotrix::twoord.plot(common_time,
+                       combined_diff[,i],
+                       common_time,
+                       combined_diff$residuals,
+                       type = c("l","l"),
+                       xaxt = "n",
+                       rylab = "number of daily fluctuation of covid 19 cases",
+                       ylab = paste("daily change in", colnames(combined_diff)[i]))
+                       
+}
+```
+
+### Step 5: Construct VAR model
+```{r construct var, warning = FALSE}
+# variable selection based on AIC
+optimal_assault <- VARselect(na.omit(combined_diff)[,c(1,6)], type = 'none', lag.max = 10)
+optimal_autotheft <- VARselect(na.omit(combined_diff)[,c(2,6)], type = 'none', lag.max = 10)
+optimal_burglary <- VARselect(na.omit(combined_diff)[,c(3,6)], type = 'none', lag.max = 10)
+optimal_larceny <- VARselect(na.omit(combined_diff)[,c(4,6)], type = 'none', lag.max = 10)
+optimal_robbery <- VARselect(na.omit(combined_diff)[,c(5,6)], type = 'none', lag.max = 10)
+
+# use AIC as selection criteria
+VAR_assault <- VAR(y=as.ts(na.omit(combined_diff)[,c(1,6)]), p=optimal_assault$selection[1])
+VAR_autotheft <- VAR(y=as.ts(na.omit(combined_diff)[,c(2,6)]),
+                     p=optimal_autotheft$selection[1])
+VAR_burglary <- VAR(y=as.ts(na.omit(combined_diff)[,c(3,6)]),
+                    p=optimal_burglary$selection[1])
+VAR_larceny <- VAR(y=as.ts(na.omit(combined_diff)[,c(4,6)]),
+                               p=optimal_larceny$selection[1])
+VAR_robbery <- VAR(y=as.ts(na.omit(combined_diff)[,c(5,6)]),
+                              p=optimal_robbery$selection[1])
+```
+
+### Step 6: Granger Causality test
+
+```{r}
+causality(VAR_assault, cause = colnames(combined_diff)[1])
+causality(VAR_assault, cause = "residuals")
+```
+
+```{r}
+causality(VAR_autotheft, cause = colnames(combined_diff)[2])
+causality(VAR_autotheft, cause = "residuals")
+```
+```{r}
+causality(VAR_burglary, cause = colnames(combined_diff)[3])
+causality(VAR_burglary, cause = "residuals")
+```
+
+```{r}
+causality(VAR_larceny, cause = colnames(combined_diff)[4])
+causality(VAR_larceny, cause = "residuals")
+```
+
+```{r}
+causality(VAR_robbery, cause = colnames(combined_diff)[5])
+causality(VAR_robbery, cause = "residuals")
+```
+
+### Step 7: Impulse Response Function
+
+Only burglary weakly significant (p-value = 0.07361)
+```{r irf}
+lags = c(1:25)
+
+# only covid significant to burglary
+irf_burglary_1 <- irf(VAR_burglary,
+                      impulse = "residuals",
+                      response = "burglary",
+                      n.ahead = 24)
+# ggplot
+irf_burglary_1_gg <- data.frame(irf_burglary_1$irf$residuals[,1],
+                                irf_burglary_1$Lower$residuals[,1],
+                                irf_burglary_1$Upper$residuals[,1])
+
+colnames(irf_burglary_1_gg) <- c("mean", "lower", "upper")
+
+irf_burglary_1_plot <- ggplot(irf_burglary_1_gg, aes(x=lags)) +
+  geom_line(aes(y = mean), color = "black") +
+  geom_hline(yintercept = 0, color = "blue") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "lightblue", alpha = 0.5) +
+  theme_classic() +
+  ggtitle("How many more burglary cases per day there will be 
+          after 1 confirmed covid19 case") +
+  xlab("Number of days after a confimed covid 19 case")+
+  ylab("Number of bulglary cases")
+
+ggplotly(irf_burglary_1_plot)
+```
+
+### Step 8: Forecast
+```{r custom function}
+interval_value_formatter <- "function(num, opts, seriesName, g, row, col) {
+  value = g.getValue(row, col);
+  if(value[0] != value[2]) {
+    lower = Dygraph.numberValueFormatter(value[0], opts);
+    upper = Dygraph.numberValueFormatter(value[2], opts);
+    return '[' + lower + ', ' + upper + ']';
+  } else {
+    return Dygraph.numberValueFormatter(num, opts);
+  }
+}"
+```
+
+```{r}
+f_burglary <- forecast(VAR_burglary)
+f_burglary$forecast$burglary %>% 
+  {cbind(actuals=.$x, forecast_mean=.$mean,
+         lower_95=.$lower[,"95%"], upper_95=.$upper[,"95%"],
+         lower_80=.$lower[,"80%"], upper_80=.$upper[,"80%"])} %>%
+  dygraph(main = 'Prediction on how many more burglary cases
+          compared to yesterday', 
+          ylab = 'Day-to-day change') %>%
+  dyAxis("y", valueFormatter = interval_value_formatter) %>%
+  dySeries("actuals", color = "black") %>%
+  dySeries("forecast_mean", color = "blue", label = "forecast") %>%
+  dySeries(c("lower_80", "forecast_mean", "upper_80"),
+           label = "80%", color = "blue") %>%
+  dySeries(c("lower_95", "forecast_mean", "upper_95"),
+           label = "95%", color = "blue")%>%
+  dyLegend(show = 'follow') %>%
+  dyAxis("x", label = paste("Numebr of days since", common_time[1]))
+```
+
+```{r}
+f_assault <- forecast(VAR_assault)
+f_assault$forecast$assault %>% 
+  {cbind(actuals=.$x, forecast_mean=.$mean,
+         lower_95=.$lower[,"95%"], upper_95=.$upper[,"95%"],
+         lower_80=.$lower[,"80%"], upper_80=.$upper[,"80%"])} %>%
+  dygraph(main = 'Prediction on how many more aggregate assault cases
+          compared to yesterday', 
+          ylab = 'Day-to-day change') %>%
+  dyAxis("y", valueFormatter = interval_value_formatter) %>%
+  dySeries("actuals", color = "black") %>%
+  dySeries("forecast_mean", color = "blue", label = "forecast") %>%
+  dySeries(c("lower_80", "forecast_mean", "upper_80"),
+           label = "80%", color = "blue") %>%
+  dySeries(c("lower_95", "forecast_mean", "upper_95"),
+           label = "95%", color = "blue")%>%
+  dyLegend(show = 'follow') %>%
+  dyAxis("x", label = paste("Numebr of days since", common_time[1]))
+```
+
+```{r}
+f_autotheft <- forecast(VAR_autotheft)
+f_autotheft$forecast$autotheft %>% 
+  {cbind(actuals=.$x, forecast_mean=.$mean,
+         lower_95=.$lower[,"95%"], upper_95=.$upper[,"95%"],
+         lower_80=.$lower[,"80%"], upper_80=.$upper[,"80%"])} %>%
+  dygraph(main = 'Prediction on how many more auto theft cases
+          compared to yesterday', 
+          ylab = 'Day-to-day change') %>%
+  dyAxis("y", valueFormatter = interval_value_formatter) %>%
+  dySeries("actuals", color = "black") %>%
+  dySeries("forecast_mean", color = "blue", label = "forecast") %>%
+  dySeries(c("lower_80", "forecast_mean", "upper_80"),
+           label = "80%", color = "blue") %>%
+  dySeries(c("lower_95", "forecast_mean", "upper_95"),
+           label = "95%", color = "blue")%>%
+  dyLegend(show = 'follow') %>%
+  dyAxis("x", label = paste("Numebr of days since", common_time[1]))
+```
+
+```{r}
+f_larceny <- forecast(VAR_larceny)
+f_larceny$forecast$larceny %>% 
+  {cbind(actuals=.$x, forecast_mean=.$mean,
+         lower_95=.$lower[,"95%"], upper_95=.$upper[,"95%"],
+         lower_80=.$lower[,"80%"], upper_80=.$upper[,"80%"])} %>%
+  dygraph(main = 'Prediction on how many more larceny cases
+          compared to yesterday', 
+          ylab = 'Day-to-day change') %>%
+  dyAxis("y", valueFormatter = interval_value_formatter) %>%
+  dySeries("actuals", color = "black") %>%
+  dySeries("forecast_mean", color = "blue", label = "forecast") %>%
+  dySeries(c("lower_80", "forecast_mean", "upper_80"),
+           label = "80%", color = "blue") %>%
+  dySeries(c("lower_95", "forecast_mean", "upper_95"),
+           label = "95%", color = "blue")%>%
+  dyLegend(show = 'follow') %>%
+  dyAxis("x", label = paste("Numebr of days since", common_time[1]))
+```
+
+```{r}
+f_robbery <- forecast(VAR_robbery)
+f_robbery$forecast$robbery %>% 
+  {cbind(actuals=.$x, forecast_mean=.$mean,
+         lower_95=.$lower[,"95%"], upper_95=.$upper[,"95%"],
+         lower_80=.$lower[,"80%"], upper_80=.$upper[,"80%"])} %>%
+  dygraph(main = 'Prediction on how many more robbery cases
+          compared to yesterday', 
+          ylab = 'Day-to-day change') %>%
+  dyAxis("y", valueFormatter = interval_value_formatter) %>%
+  dySeries("actuals", color = "black") %>%
+  dySeries("forecast_mean", color = "blue", label = "forecast") %>%
+  dySeries(c("lower_80", "forecast_mean", "upper_80"),
+           label = "80%", color = "blue") %>%
+  dySeries(c("lower_95", "forecast_mean", "upper_95"),
+           label = "95%", color = "blue")%>%
+  dyLegend(show = 'follow') %>%
+  dyAxis("x", label = paste("Numebr of days since", common_time[1]))
+```
+
+
+

@@ -1,0 +1,232 @@
+---
+title: "COVID-19 and US Crime"
+author: "American Statistical Association Datafest"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    theme: flatly
+    source: embed
+---
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(plotly)
+library(plyr)
+library(flexdashboard)
+library(RSocrata)
+library(tidyverse)
+library(tsbox) # transform data into time series
+library(xts)
+library(COVID19) # to get data about covid 19
+library(aTSA) # adf.test
+library(forecast) #ariRI model
+library(vars) #VAR and Causality
+library(dygraphs)
+
+# Make some noisily increasing data [Testing Purposes]
+set.seed(955)
+dat <- data.frame(cond = rep(c("A", "B"), each=10),
+                  xvar = 1:20 + rnorm(20,sd=3),
+                  yvar = 1:20 + rnorm(20,sd=3))
+
+#Load Chicago Data
+covid19_CH <- covid19("USA", level = 3) %>%
+  # this cook county contains chicago
+  filter(administrative_area_level_3 == "Cook",
+         administrative_area_level_2 == "Illinois" ) %>%
+  # filter out days when confirmed is zero or one
+  # becasue when it was 2 for a very long time
+  filter(confirmed > 2)
+
+```
+
+Chicago
+=======================================================================
+
+Row
+-----------------------------------------------------------------------
+
+
+### 
+```{r, echo = FALSE}
+#Overview of the data
+# plot cumulative cases
+# extract for transforming into time series
+ts_CH <- covid19_CH %>%
+  dplyr::select(date, confirmed) %>%
+  ts_xts()
+
+#Html Time Series Widgets (Double Click to reset)
+dygraph(ts_CH,main = "Cumulative confirmed cases
+         of COVID 19 in Chicago")
+
+
+covid19_CH_diff <- data.frame(diff(covid19_CH$confirmed))
+colnames(covid19_CH_diff)[1] = "confirmed"
+covid19_CH_diff$date = covid19_CH$date[2:length(covid19_CH$date)]
+```
+
+Row
+-----------------------------------------------------------------------
+
+### 
+
+```{r, echo = FALSE}
+ts_diff_CH <- na.omit(diff(ts_CH))
+
+dygraph(ts_diff_CH,
+         main = "Daily confirmed cases of
+         COVID19 in Chicago")
+
+```
+
+Row
+-----------------------------------------------------------------------
+
+### Year to Year Comparisom
+
+```{r}
+chicago <- RSocrata::read.socrata(
+  "https://data.cityofchicago.org/resource/ijzp-q8t2.csv?$where=year >= 2014",
+  app_token = "hPU78MH7zKApdpUv4OVCInPOQ")
+
+
+# add date
+chicago <- chicago %>%
+  mutate(Date = substr(date, start = 1, stop = 10)) %>%
+  mutate(y_month  = substr(date, start = 1, stop = 7)) %>%
+  mutate(month = substr(date, start = 6, stop = 7))
+# summary of all crime
+chicago_summary <- chicago %>%
+  group_by(primary_type) %>%
+  summarise(number_of_crime = n()) %>%
+  arrange(desc(number_of_crime))
+
+# looks life theft is seeing sharp drop
+
+# year to year comparison
+chicago %>%
+  dplyr::select(y_month, month, primary_type, year) %>%
+  filter(primary_type %in% chicago_summary$primary_type[1:5]) %>%
+  count(year, month, primary_type) %>%
+  na.omit()
+
+
+  plt<- ggplot(aes(x=month, y=n, group = year, color = as.character(year))) +
+        geom_line() + facet_wrap(~primary_type) + ggtitle("year to year comparison of the top 5 crime in Chicago in the past 6 years")
+```
+
+### Constraining Slope with stat_smooth
+
+```{r}
+n <- 20
+x1 <- rnorm(n); x2 <- rnorm(n)
+y1 <- 2 * x1 + rnorm(n)
+y2 <- 3 * x2 + (2 + rnorm(n))
+A <- as.factor(rep(c(1, 2), each = n))
+df <- data.frame(x = c(x1, x2), y = c(y1, y2), A = A)
+fm <- lm(y ~ x + A, data = df)
+
+p <- ggplot(data = cbind(df, pred = predict(fm)), aes(x = x, y = y, color = A))
+p <- p + geom_point() + geom_line(aes(y = pred))
+ggplotly(p)
+```
+Row
+-----------------------------------------------------------------------
+
+### geom_smooth with Loess Smoothed Fit
+
+```{r}
+p <- ggplot(dat, aes(x=xvar, y=yvar)) +
+            geom_point(shape=1) +    # Use hollow circles
+            geom_smooth()            # Add a loess smoothed fit curve with confidence region
+ggplotly(p)
+```
+
+### Constraining Slope with stat_smooth
+
+```{r}
+n <- 20
+x1 <- rnorm(n); x2 <- rnorm(n)
+y1 <- 2 * x1 + rnorm(n)
+y2 <- 3 * x2 + (2 + rnorm(n))
+A <- as.factor(rep(c(1, 2), each = n))
+df <- data.frame(x = c(x1, x2), y = c(y1, y2), A = A)
+fm <- lm(y ~ x + A, data = df)
+
+p <- ggplot(data = cbind(df, pred = predict(fm)), aes(x = x, y = y, color = A))
+p <- p + geom_point() + geom_line(aes(y = pred))
+ggplotly(p)
+```
+
+
+page 2
+=======================================================================
+
+Row
+-----------------------------------------------------------------------
+
+### stat_density Example
+
+```{r}
+dfGamma = data.frame(nu75 = rgamma(100, 0.75),
+           nu1 = rgamma(100, 1),
+           nu2 = rgamma(100, 2))
+
+dfGamma = stack(dfGamma)
+
+p <- ggplot(dfGamma, aes(x = values)) +
+            stat_density(aes(group = ind, color = ind),position="identity",geom="line")
+ggplotly(p)
+```
+
+### Add Conditional Density Curves to Plot
+
+```{r}
+p <- ggplot(dat, aes(x=xvar, y=yvar)) +
+            geom_point(shape=1)      # Use hollow circles
+ggplotly(p)
+```
+
+Row
+-----------------------------------------------------------------------
+
+### geom_density and facet_wrap Together
+
+```{r}
+dd<-data.frame(matrix(rnorm(144, mean=2, sd=2),72,2),c(rep("A",24),rep("B",24),rep("C",24)))
+colnames(dd) <- c("x_value", "Predicted_value",  "State_CD")
+
+dd <- data.frame(
+  predicted = rnorm(72, mean = 2, sd = 2),
+  state = rep(c("A", "B", "C"), each = 24)
+)
+
+grid <- with(dd, seq(min(predicted), max(predicted), length = 100))
+normaldens <- ddply(dd, "state", function(df) {
+  data.frame(
+    predicted = grid,
+    density = dnorm(grid, mean(df$predicted), sd(df$predicted))
+  )
+})
+
+p <- ggplot(dd, aes(predicted))  +
+            geom_density() +
+            geom_line(aes(y = density), data = normaldens, colour = "red") +
+            facet_wrap(~ state)
+ggplotly(p)
+```
+
+### Density and Scatterplot Overlay Using geom_density
+
+```{r}
+df <- data.frame(x <- rchisq(1000, 10, 10),
+                 y <- rnorm(1000))
+
+p <- ggplot(df, aes(x, y)) + 
+     geom_point(alpha = 0.5) + 
+     geom_density_2d() + 
+     theme(panel.background = element_rect(fill = '#ffffff'))
+
+ggplotly(p)
+```

@@ -1,0 +1,517 @@
+---
+title: "LA"
+author: "Zhuyi Huang"
+output: pdf_document
+---
+```{r library, message = FALSE, warning = FALSE}
+library(RSocrata)
+library(tidyverse)
+library(tseries)
+library(tsbox) # transform data into time series
+library(xts)
+library(COVID19) # to get data about covid 19
+library(forecast) #arima model
+library(vars) #VAR and Causality
+library(plotly)
+library(dygraphs)
+```
+
+
+### Extract crime data
+```{r get LA data}
+# 2020 only
+LA_2020 <- read.socrata(
+  'http://data.lacity.org/resource/2nrs-mtv8.csv',
+  app_token = "hPU78MH7zKApdpUv4OVCInPOQ")
+
+# 2014-2019
+LA_2014 <- read.socrata(
+  "https://data.lacity.org/resource/63jg-8b9z.csv?$where=date_occ >=  '2014-01-01'",
+  app_token = "hPU78MH7zKApdpUv4OVCInPOQ"
+)
+
+LA <- rbind(LA_2014, LA_2020)
+remove(LA_2014)
+remove(LA_2020)
+
+head(LA)
+
+# add date
+LA <- LA %>%
+  mutate(y_month  = substr(date_occ, start = 1, stop = 7)) %>%
+  mutate(month = substr(date_occ, start = 6, stop = 7)) %>%
+  mutate(year = substr(date_occ, start = 1, stop = 4))
+```
+
+```{r}
+# summary of all crime
+LA_summary <- LA %>%
+  group_by(crm_cd_desc) %>%
+  summarise(number_of_crime = n()) %>%
+  arrange(desc(number_of_crime))
+
+# bar chart of 5 most frequent crime over the years
+LA %>%
+  filter(crm_cd_desc %in% head(LA_summary$crm_cd_desc, 5)) %>%
+  ggplot(aes(x=crm_cd_desc, fill=crm_cd_desc)) +
+  geom_bar(width = 0.5) +
+  coord_flip() +
+  theme_classic() +
+  labs(y='Number of Crimes',x='Offense Description')
+
+# per month
+# exclude June
+LA %>%
+  dplyr::select(month, crm_cd_desc) %>%
+  filter(crm_cd_desc %in% LA_summary$crm_cd_desc[1:5], month != 06) %>% 
+  count(month, crm_cd_desc) %>%
+  ggplot(aes(month, n, group = crm_cd_desc, color = crm_cd_desc)) +
+  geom_line() +
+  scale_color_brewer(palette = "Set1") +
+  ggtitle("Monthly frequency of top 5 crime in LA in 2020") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# daily
+# 2020 only
+# similar scale, so use same scale for all graphs
+daily <- LA %>%
+  dplyr::select(date_occ, crm_cd_desc, year) %>%
+  filter(crm_cd_desc %in% LA_summary$crm_cd_desc[1:5],
+         year == 2020) %>%
+  count(date_occ, crm_cd_desc) %>%
+  ggplot(aes(date_occ, n, group = crm_cd_desc, color = crm_cd_desc)) +
+  geom_line() +
+  facet_free(~crm_cd_desc) +
+  scale_fill_brewer(palette = "Set1", breaks = rev(levels(LA_summary$crm_cd_desc[1:5]))) +
+  ggtitle("Frequency of top 5 crime in LA in 2020") +
+  theme(legend.position = "none")
+  
+ggplotly(daily)
+
+# year to year comparison
+# exlcude 2020-06
+# similar scale, so use same scale for all graphs
+yty <- LA %>%
+  dplyr::select(y_month, month, crm_cd_desc, year) %>%
+  filter(crm_cd_desc %in% LA_summary$crm_cd_desc[1:5],
+         y_month != "2020-06") %>%
+  count(year, month, crm_cd_desc) %>%
+  na.omit() %>%
+  ggplot(aes(x=month, y=n,
+             group = year,
+             color = as.character(year))) +
+  geom_line() +
+  facet_free(~crm_cd_desc) +
+  guides(color = guide_legend(reverse = TRUE)) +
+  ggtitle("year to year comparison of the top 5 crime in LA in the past 6 years") +
+  labs(col="Year")
+
+ggplotly(yty) %>%
+  layout(legend=list(traceorder="reversed"))
+```
+
+## VAR 
+### Step1 : Extract cases
+```{r extract cases}
+# extract top 5 crime
+top5crime <- LA %>%
+  filter(crm_cd_desc %in% head(LA_summary$crm_cd_desc, 5)) %>%
+  group_by(date_occ, crm_cd_desc) %>%
+  tally() %>%
+  spread(crm_cd_desc, n)
+
+# rename columns
+colnames(top5crime) <- c('time',
+                         "battery",
+                         "burglary",
+                         'burglary from vehicle',
+                         "vandalism",
+                         'vehicle')
+# create date
+top5crime$time <- as.Date(top5crime$time,
+                          format = "%Y-%m-%d")
+top5crime <- na.omit(top5crime)
+# create time series
+top5crime_xts <- ts_xts(top5crime[,1:2])
+
+for (i in (3:ncol(top5crime))){
+  temp_xts <- ts_xts(top5crime[, c(1,i)])
+  top5crime_xts <- merge(top5crime_xts, temp_xts)
+}
+
+# extract difference, change per day
+top5crime_diff <- na.omit(diff(top5crime_xts))
+```
+
+### Step 2: Construct combined time series
+#### COVID 19 RELATED
+```{r covid 19 extract Pennsylvania data}
+# extract LA data from US data. 
+covid19_LA <- covid19("USA", level = 3) %>%
+  filter(administrative_area_level_3 == "Los Angeles",
+         administrative_area_level_2 == "California") %>%
+  # stayed at 1 for long time
+  filter(confirmed > 1,
+         date < "2020-06-11")
+
+# calculate the difference per day
+covid19_LA_diff <- data.frame(diff(covid19_LA$confirmed))
+colnames(covid19_LA_diff)[1] = "confirmed"
+covid19_LA_diff$date = covid19_LA$date[2:length(covid19_LA$date)]
+
+head(covid19_LA)
+```
+
+```{r covid 19 related exploration}
+# extract for tranforming into time series data
+ts_LA <- covid19_LA %>% 
+  dplyr::select(date, confirmed) %>%
+  ts_xts()
+
+# plot time series of California infection
+ts_plot(ts_LA)
+# conduct ADF Test
+adf.test(as.ts(ts_LA))
+
+# try first log difference
+ts_diff_LA <- diff(ts_LA)
+ts_plot(ts_diff_LA)
+# still clearly not stationary
+# need de-trend
+
+# de-trend 
+# GAMM model from STA303 A3
+
+# time as integer
+covid19_LA_diff$timeInt = as.numeric(covid19_LA_diff$date)
+# make a copy to avoid perfect collinearity
+covid19_LA_diff$timeIid = covid19_LA_diff$timeInt
+
+# make a copy to avoid perfect collinearity
+covid19_LA_diff$timeIid = covid19_LA_diff$timeInt
+
+# GAMM model
+# 50 too overfit. 15 looks decent
+gamLA <- gamm4::gamm4(confirmed ~  s(timeInt, k=90), random = ~(1|timeIid), 
+	data=covid19_LA_diff, family=poisson(link='log'))
+```
+
+```{r plot GAMM}
+lme4::VarCorr(gamLA$mer)
+# looks like random intercept is making little difference.
+# choose to not have random effect to preserve it for time series analysis
+
+# plot fitted value
+toPredict = data.frame(time = seq(covid19_LA_diff$date[1], 
+                                          covid19_LA_diff$date[length(covid19_LA_diff$date)],
+                                  by = '1 day'))
+toPredict$timeInt = as.numeric(toPredict$time)
+
+matplot(toPredict$time, 
+        exp(do.call(cbind, mgcv::predict.gam(gamLA$gam, toPredict, se.fit=TRUE)) %*% 
+              Pmisc::ciMat()), 
+        col='red', lty=c(1,2,2), type='l', xaxt='n', xlab='', ylab='Daliy Confirmed cases', 
+        ylim = c(0.5, 2000), xlim = as.Date(c(covid19_LA$date[1], covid19_LA$date[length(covid19_LA$date)])))
+title("Daily confirmed cases of COVID 19 in LA")
+matpoints(toPredict$time, covid19_LA_diff$confirmed, 
+          col = 'black',
+          type = 'l')
+```
+
+```{r covid 19 residuals}
+# obtain forecast
+forecast <- data.frame(exp(do.call(cbind, mgcv::predict.gam(gamLA$gam, toPredict, se.fit=TRUE))))
+
+# access residuals
+LA_res <- data.frame(covid19_LA_diff$confirmed - forecast$fit)
+
+# transform into time series
+LA_res$time = covid19_LA_diff$date
+colnames(LA_res)[1] = "residuals"
+
+col_order <- c("time", "residuals")
+LA_res <- LA_res[, col_order]
+
+LA_res_ts <- ts_xts(LA_res)
+
+plot.xts(LA_res_ts)
+# adf test
+adf.test(as.ts(LA_res_ts))
+```
+
+```{r top 5 crime VAR}
+# specify common time range
+# start from when covid was a thing
+# end with crime since it is manually updated
+common_time <- seq.Date(start(LA_res_ts), as.Date("2020-05-25"), by = "day")
+
+# combine time series of crime and covid
+combined_diff <- merge(top5crime_diff[paste(common_time[1],
+                                            common_time[length(common_time)],
+                                            sep = "/")],
+                       LA_res_ts[paste(common_time[1],
+                                            common_time[length(common_time)],
+                                            sep = "/")])
+
+```
+
+### Step 3: Plot each crime with covid
+```{r plot together}
+for (i in 1:(ncol(combined_diff) - 1)){
+  plotrix::twoord.plot(common_time,
+                       combined_diff[,i],
+                       common_time,
+                       combined_diff$residuals,
+                       type = c("l","l"),
+                       xaxt = "n",
+                       rylab = "number of daily fluctuation of covid 19 cases",
+                       ylab = paste("daily change in", colnames(combined_diff)[i]))
+                       
+}
+```
+
+### Step 5: Construct VAR model
+```{r construct var}
+optimal_battery <- VARselect(na.omit(combined_diff)[,c(1,6)], type = 'none', lag.max = 10)
+optimal_burglary <- VARselect(na.omit(combined_diff)[,c(2,6)], type = 'none', lag.max = 10)
+optimal_burglary_vehicle <- VARselect(na.omit(combined_diff)[,c(3,6)], type = 'none', lag.max = 10)
+optimal_vandalism <- VARselect(na.omit(combined_diff)[,c(4,6)], type = 'none', lag.max = 10)
+optimal_vehicle <- VARselect(na.omit(combined_diff)[,c(5,6)], type = 'none', lag.max = 10)
+
+VAR_battery <- VAR(y=as.ts(na.omit(combined_diff)[,c(1,6)]),
+                   p=optimal_battery$selection[1])
+VAR_burglary <- VAR(y=as.ts(na.omit(combined_diff)[,c(2,6)]),
+                    p=optimal_burglary$selection[1])
+VAR_burglary_vehicle <- VAR(y=as.ts(na.omit(combined_diff)[,c(3,6)]),
+                    p=optimal_burglary_vehicle$selection[1])
+VAR_vandalism <- VAR(y=as.ts(na.omit(combined_diff)[,c(4,6)]),
+                    p=optimal_vandalism$selection[1])
+VAR_vehicle <- VAR(y=as.ts(na.omit(combined_diff)[,c(5,6)]),
+                   p=optimal_vehicle$selection[1])
+```
+
+### Step 6: Granger Causality test
+#### BATTERY
+```{r granger offense}
+causality(VAR_battery, cause = colnames(combined_diff)[1])
+causality(VAR_battery, cause = "residuals")
+```
+Battery weakly significant to covid.
+
+#### BURGLARY
+```{r}
+causality(VAR_burglary, cause = colnames(combined_diff)[2])
+causality(VAR_burglary, cause = "residuals")
+```
+Burglary significant to covid.
+
+#### BURGLARY FROM VEHICLE
+```{r}
+causality(VAR_burglary_vehicle, cause = colnames(combined_diff)[3])
+causality(VAR_burglary_vehicle, cause = "residuals")
+```
+Nothing significant.
+
+#### VANDALISM
+```{r}
+causality(VAR_vandalism, cause = colnames(combined_diff)[4])
+causality(VAR_vandalism, cause = "residuals")
+```
+Nothing significant.
+
+#### STOLEN VEHICLE
+```{r}
+causality(VAR_vehicle, cause = colnames(combined_diff)[5])
+causality(VAR_vehicle, cause = "residuals")
+```
+Nothing significant.
+
+### Step 7: Impulse Response Function
+
+Battery (weakly) and Burglary significant to covid
+
+```{r irf}
+lags = c(1:25)
+
+par(mfrow = c(1,2))
+# battery
+# criem significant to covid
+irf_battery_1 <- irf(VAR_battery,
+                     impulse = "battery",
+                     response = "residuals",
+                     n.ahead = 24)
+
+# html plot for battery
+irf_battery_1_gg <- data.frame(
+  irf_battery_1$irf$battery[,1],
+  irf_battery_1$Lower$battery[,1],
+  irf_battery_1$Upper$battery[,1]
+)
+
+colnames(irf_battery_1_gg) <- c("mean", "lower", "upper")
+
+irf_battery_1_plot <- ggplot(irf_battery_1_gg, aes(x=lags)) +
+  geom_line(aes(y = mean), color = "black") +
+  geom_hline(yintercept = 0, color = "blue") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "lightblue", alpha = 0.5) +
+  theme_classic() +
+  ggtitle("How many more daily covid19 cases there will be 
+          after 1 battery case") +
+  xlab("Number of days after a battery case")+
+  ylab("Number of new covid 19 cases")
+
+ggplotly(irf_battery_1_plot)
+
+# burglary
+# crime significant to covid
+irf_burglary_1 <- irf(VAR_burglary,
+                      impulse = "burglary",
+                      response = "residuals",
+                      n.ahead = 24)
+
+irf_burglary_1_gg <- data.frame(
+  irf_burglary_1$irf$burglary[,1],
+  irf_burglary_1$Lower$burglary[,1],
+  irf_burglary_1$Upper$burglary[,1]
+)
+
+colnames(irf_burglary_1_gg) <- c("mean", "lower", "upper")
+
+irf_burglary_1_plot <- ggplot(irf_burglary_1_gg, aes(x=lags)) +
+  geom_line(aes(y = mean), color = "black") +
+  geom_hline(yintercept = 0, color = "blue") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "lightblue", alpha = 0.5) +
+  theme_classic() +
+  ggtitle("How many more daily covid19 cases there will be 
+          after 1 burglary case") +
+  xlab("Number of days after a burglary case")+
+  ylab("Number of new covid 19 cases")
+
+ggplotly(irf_burglary_1_plot)
+```
+
+### Step 8: Forecast
+```{r custom function}
+interval_value_formatter <- "function(num, opts, seriesName, g, row, col) {
+  value = g.getValue(row, col);
+  if(value[0] != value[2]) {
+    lower = Dygraph.numberValueFormatter(value[0], opts);
+    upper = Dygraph.numberValueFormatter(value[2], opts);
+    return '[' + lower + ', ' + upper + ']';
+  } else {
+    return Dygraph.numberValueFormatter(num, opts);
+  }
+}"
+```
+
+```{r var forecast}
+# battery
+# covid not significant to crime
+forecast_battery <- forecast(VAR_battery)
+
+forecast_battery$forecast$battery %>%
+  {cbind(actuals = .$x, forecast_mean=.$mean,
+         lower_95=.$lower[,"95%"], upper_95=.$upper[,"95%"],
+         lower_80=.$lower[,"80%"], upper_80=.$upper[,"80%"])} %>%
+  dygraph(main = "Daily forecast for day-to-day change in battery cases in LA",
+          ylab = "Day-to-day change") %>%
+  dyAxis("y", valueFormatter = interval_value_formatter) %>%
+  dySeries("actuals", color = "black") %>%
+  dySeries("forecast_mean", color = "blue", label = "forecast") %>%
+  dySeries(c("lower_80", "forecast_mean", "upper_80"),
+           label = "80%", color = "blue") %>%
+  dySeries(c("lower_95", "forecast_mean", "upper_95"),
+           label = "95%", color = "blue")%>%
+  dyLegend(labelsSeparateLines=TRUE) %>%
+  dyRangeSelector() %>%
+  dyAxis("x", label = paste("Numebr of days since", common_time[1])) %>%
+  dyLegend(show = "follow")
+
+# burglary
+# not significant to burglary
+forecast_burglary <- forecast(VAR_burglary)
+
+forecast_burglary$forecast$burglary %>%
+  {cbind(actuals = .$x, forecast_mean=.$mean,
+         lower_95=.$lower[,"95%"], upper_95=.$upper[,"95%"],
+         lower_80=.$lower[,"80%"], upper_80=.$upper[,"80%"])} %>%
+  dygraph(main = "Daily forecast for day-to-day change in burglary cases in LA",
+          ylab = "Day-to-day change") %>%
+  dyAxis("y", valueFormatter = interval_value_formatter) %>%
+  dySeries("actuals", color = "black") %>%
+  dySeries("forecast_mean", color = "blue", label = "forecast") %>%
+  dySeries(c("lower_80", "forecast_mean", "upper_80"),
+           label = "80%", color = "blue") %>%
+  dySeries(c("lower_95", "forecast_mean", "upper_95"),
+           label = "95%", color = "blue")%>%
+  dyLegend(labelsSeparateLines=TRUE) %>%
+  dyRangeSelector() %>%
+  dyAxis("x", label = paste("Numebr of days since", common_time[1])) %>%
+  dyLegend(show = "follow")
+
+# burglary from vehicle
+# not significant
+forecast_burglary_vehicle <- forecast(VAR_burglary_vehicle)
+
+forecast_burglary_vehicle$forecast$burglary.from.vehicle %>%
+  {cbind(actuals = .$x, forecast_mean=.$mean,
+         lower_95=.$lower[,"95%"], upper_95=.$upper[,"95%"],
+         lower_80=.$lower[,"80%"], upper_80=.$upper[,"80%"])} %>%
+  dygraph(main = "Daily forecast for day-to-day change in burglary from vehicle cases in LA",
+          ylab = "Day-to-day change") %>%
+  dyAxis("y", valueFormatter = interval_value_formatter) %>%
+  dySeries("actuals", color = "black") %>%
+  dySeries("forecast_mean", color = "blue", label = "forecast") %>%
+  dySeries(c("lower_80", "forecast_mean", "upper_80"),
+           label = "80%", color = "blue") %>%
+  dySeries(c("lower_95", "forecast_mean", "upper_95"),
+           label = "95%", color = "blue")%>%
+  dyLegend(labelsSeparateLines=TRUE) %>%
+  dyRangeSelector() %>%
+  dyAxis("x", label = paste("Numebr of days since", common_time[1])) %>%
+  dyLegend(show = "follow")
+
+# vandalism
+# not significant
+forecast_vandalism <- forecast(VAR_vandalism)
+
+forecast_vandalism$forecast$vandalism %>%
+  {cbind(actuals = .$x, forecast_mean=.$mean,
+         lower_95=.$lower[,"95%"], upper_95=.$upper[,"95%"],
+         lower_80=.$lower[,"80%"], upper_80=.$upper[,"80%"])} %>%
+  dygraph(main = "Daily forecast for day-to-day change in vandalism cases in LA",
+          ylab = "Day-to-day change") %>%
+  dyAxis("y", valueFormatter = interval_value_formatter) %>%
+  dySeries("actuals", color = "black") %>%
+  dySeries("forecast_mean", color = "blue", label = "forecast") %>%
+  dySeries(c("lower_80", "forecast_mean", "upper_80"),
+           label = "80%", color = "blue") %>%
+  dySeries(c("lower_95", "forecast_mean", "upper_95"),
+           label = "95%", color = "blue")%>%
+  dyLegend(labelsSeparateLines=TRUE) %>%
+  dyRangeSelector() %>%
+  dyAxis("x", label = paste("Numebr of days since", common_time[1])) %>%
+  dyLegend(show = "follow")
+
+# stolen vehicle
+# not significant
+forecast_stolen_vehicle <- forecast(VAR_vehicle)
+
+forecast_stolen_vehicle$forecast$vehicle %>%
+  {cbind(actuals = .$x, forecast_mean=.$mean,
+         lower_95=.$lower[,"95%"], upper_95=.$upper[,"95%"],
+         lower_80=.$lower[,"80%"], upper_80=.$upper[,"80%"])} %>%
+  dygraph(main = "Daily forecast for day-to-day change in stolen vehicle cases in LA",
+          ylab = "Day-to-day change") %>%
+  dyAxis("y", valueFormatter = interval_value_formatter) %>%
+  dySeries("actuals", color = "black") %>%
+  dySeries("forecast_mean", color = "blue", label = "forecast") %>%
+  dySeries(c("lower_80", "forecast_mean", "upper_80"),
+           label = "80%", color = "blue") %>%
+  dySeries(c("lower_95", "forecast_mean", "upper_95"),
+           label = "95%", color = "blue")%>%
+  dyLegend(labelsSeparateLines=TRUE) %>%
+  dyRangeSelector() %>%
+  dyAxis("x", label = paste("Numebr of days since", common_time[1])) %>%
+  dyLegend(show = "follow")
+```

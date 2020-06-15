@@ -1,0 +1,893 @@
+---
+title: "Boston organized"
+author: "Zhengkai Fu"
+date: "14/05/2020"
+output:
+  pdf_document: default
+  html_document: default
+---
+```{r library, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(tsbox) # transform data into time series
+library(xts)
+library(COVID19) # to get data about covid 19
+library(aTSA) # adf.test
+library(forecast) #arima model
+library(vars) #VAR and Causality
+library(plotly)
+library(dygraphs)
+```
+
+This document is to study the possible relationship between COVID-19 and frequency of crime committed in the city of Boston.
+
+# COVID 19
+
+## Load COVID 19 data for Massachusetts
+```{r covid 19 for MA}
+# extract MA data from US data. level 3 is by cities but cannot find Boston.
+covid19_MA <- covid19("USA", level = 2) %>%
+  filter(administrative_area_level_2 == "Massachusetts") %>%
+  # filter out days when confirmed is zero or one
+  # becasue when it was 1 for a very long time
+  filter(confirmed > 1)
+
+# brief display
+head(covid19_MA)
+```
+### Choice explained
+
+#### Scope of data
+
+The covid 19 data related to the whole state of Massachusetts are chosen, because the auther believes that suburban area and capital city are closely related in the context of disease and crime. It is well known that in America most of the residential area, suburban or rual area, is separately identifiable from commercial zone, the cities. While the crime might have happened in the city of Boston, the suspects or victims might live outside of Boston.
+
+#### Confirmed cases instead of Death count
+
+Although the number of confirmed cases can largely be influenced by the testing policy of the local government, the psychological effects of seeing confirmed cases alone might be enough to have some psychological relationship with committing crimes, which is what the author would like to explore.
+
+## Overview of the data
+### Visualization
+```{r overview of covid, message=FALSE}
+# plot cumulative cases
+# extract for transforming into time series data
+ts_MA <- covid19_MA %>% 
+  dplyr::select(date, confirmed) %>%
+  ts_xts()
+
+plot.xts(ts_MA,
+         main = "Cumulative confirmed cases 
+         of COVID19 in Boston")
+
+# plot daily cases
+# first difference
+ts_diff_MA <- diff(ts_MA)
+plot.xts(ts_diff_MA,
+         main = "Daily confirmed cases of
+         COVID19 in Boston")
+```
+
+As shown above, cumulative cases and daily cases have been plotted above.
+
+### Model the infection
+#### Construct the model
+```{r GAMM model for covid}
+# construct GAMM model from prof. Brown's work
+
+# construct data frame of difference, not time series
+covid19_MA_diff <- data.frame(diff(covid19_MA$confirmed))
+colnames(covid19_MA_diff)[1] = "confirmed"
+covid19_MA_diff$date = covid19_MA$date[2:length(covid19_MA$date)]
+
+# time as integer
+covid19_MA_diff$timeInt = as.numeric(covid19_MA_diff$date)
+# make a copy to avoid perfect collinearity for mixed effect
+covid19_MA_diff$timeIid = covid19_MA_diff$timeInt
+
+# GAMM model
+gamMA <- gamm4::gamm4(confirmed ~ s(timeInt, k = 85), 
+                      random = ~(1|timeIid),
+                      data = covid19_MA_diff,
+                      family = poisson(link = 'log'))
+# currently 70 is the max due to length of data
+```
+
+In order to study covid19's impact on Boston, its trend needs to be modeled first to have a better understanding of the situation. A Generalized Additive Mixed Model is used here, which is a direct copy from prof. Patrick Brown's work in STA303 Assignment 3.
+
+#### Visuzalization of the model
+```{r plot GAMM}
+# plot fitted value
+toPredict = data.frame(time = seq(covid19_MA_diff$date[1], 
+                                          covid19_MA_diff$date[length(covid19_MA_diff$date)],
+                                  by = '1 day'))
+toPredict$timeInt = as.numeric(toPredict$time)
+
+# plot
+
+matplot(toPredict$time, 
+        exp(do.call(cbind, mgcv::predict.gam(gamMA$gam, toPredict, se.fit=TRUE)) %*% 
+              Pmisc::ciMat()), 
+        col='red', lty=c(1,2,2), type='l', xaxt='n', xlab='', ylab='Daliy Confirmed cases', 
+        ylim = c(0.5, 3500), xlim = as.Date(c(covid19_MA$date[1], covid19_MA$date[length(covid19_MA$date)])))
+title("Daily confirmed cases of COVID 19 in Boston")
+
+matpoints(toPredict$time, covid19_MA_diff$confirmed, 
+          col = 'black',
+          type = 'l')
+```
+The overall trend of the covid 19 infection in Boston is successfully modeled and displayed above, including a 95% confidence interval. However, those are not very important. Now let's take a look at crime situation in Boston.
+
+#### Obtain the residuals
+```{r covid 19 residual}
+# obtain forecast
+forecast_covid <- data.frame(exp(do.call(cbind, mgcv::predict.gam(gamMA$gam, toPredict, se.fit=TRUE))))
+                        
+                        
+# access residuals
+MA_res <- data.frame(covid19_MA_diff$confirmed - forecast_covid$fit)
+
+# transform into time series
+MA_res$time = covid19_MA_diff$date
+colnames(MA_res)[1] = "residuals"
+
+col_order <- c("time", "residuals")
+MA_res <- MA_res[, col_order]
+
+MA_res_ts <- ts_xts(MA_res)
+
+plot.xts(MA_res_ts,
+         main = "Daily fluctuation of COVID 19 confirmd cases
+         in MA outside its overall trend")
+# adf test
+adf.test(as.ts(MA_res_ts))
+
+# lag residuals by 4 days due to testing time
+MA_res_lag <- stats::lag(MA_res_ts, k = -4)
+```
+
+The residuals obtained here represents the fluctuation of daily confirmed cases of COVID 19 in Massachusetts, in order to obtain a stationary time series for future analysis. This residuals can otherwise be interpreted as "fluctuation outside the new norm".
+
+# Boston Crime
+## Load crime data
+```{r load crime data}
+boston <- read.csv("https://data.boston.gov/dataset/6220d948-eae2-4e4b-8723-2dc8e67722a3/resource/12cb3883-56f5-47de-afa5-3b1cf61b257b/download/tmpqy9o_jgd.csv")
+head(boston)
+
+
+
+# add date
+boston <- boston %>%
+  mutate(date = as.Date(substr(OCCURRED_ON_DATE, start = 1, stop = 10))) %>%
+  mutate(y_month = substr(OCCURRED_ON_DATE, start = 1, stop = 7))
+
+```
+
+## Overview of crime situation
+```{r summary}
+boston$YEAR = as.character(boston$YEAR)
+boston$MONTH = substr(boston$date, start = 6, stop = 7)
+
+# summary of all crime
+boston_summary <- boston %>%
+  group_by(OFFENSE_DESCRIPTION) %>%
+  summarise(number_of_crime = n()) %>%
+  arrange(desc(number_of_crime))
+
+# bar chart of 5 most frequent crime over the years
+boston %>%
+  filter(OFFENSE_DESCRIPTION %in% head(boston_summary$OFFENSE_DESCRIPTION, 5)) %>%
+  ggplot(aes(x=OFFENSE_DESCRIPTION, fill = OFFENSE_DESCRIPTION)) +
+  coord_flip() +
+  geom_bar(width = 0.5) +
+  labs(y="Number of crimes", x = "offense description")
+
+# per month
+# exclude June 2020 due to incomplete data
+boston %>%
+  dplyr::select(MONTH, OFFENSE_DESCRIPTION, YEAR, y_month) %>%
+  filter(OFFENSE_DESCRIPTION %in% head(boston_summary$OFFENSE_DESCRIPTION, 5),
+         YEAR == 2020,
+         y_month != "2020-06") %>% 
+  count(MONTH, OFFENSE_DESCRIPTION) %>%
+  na.omit() %>%
+  ggplot(aes(MONTH, n, group = OFFENSE_DESCRIPTION,
+             color = OFFENSE_DESCRIPTION)) +
+  geom_line() +
+  scale_color_brewer(palette = "Set1") +
+  ggtitle("Monthly frequency of top 5 crime in Boston in 2020")
+
+# daily
+# 2020 only
+daily <- boston %>%
+  dplyr::select(date, OFFENSE_DESCRIPTION, YEAR) %>%
+  filter(OFFENSE_DESCRIPTION %in% head(boston_summary$OFFENSE_DESCRIPTION, 5),
+         YEAR == 2020) %>%
+  count(date, OFFENSE_DESCRIPTION) %>%
+  na.omit() %>%
+  ggplot(aes(date, n, group = OFFENSE_DESCRIPTION, color = OFFENSE_DESCRIPTION)) +
+  geom_line() +
+  facet_free(~OFFENSE_DESCRIPTION, space = "free") +
+  scale_fill_brewer(palette = "Set1", breaks = rev(levels(boston_summary$OFFENSE_DESCRIPTION[1:5]))) +
+  theme(legend.title = element_blank()) +
+  ylab("Cases") +
+  theme(legend.position = "none")
+
+ggplotly(daily)
+
+# bunch of crime seem to be affected by BLM protests
+
+# year to year comparison
+# exclude 2020-06 due to incomplete info
+yty <- boston %>%
+  dplyr::select(MONTH, y_month, OFFENSE_DESCRIPTION, YEAR) %>%
+  filter(OFFENSE_DESCRIPTION %in% head(boston_summary$OFFENSE_DESCRIPTION, 5),
+         y_month != "2020-06") %>%
+  count(YEAR, MONTH, OFFENSE_DESCRIPTION) %>%
+  na.omit() %>%
+  ggplot(aes(x=MONTH, y=n, group = YEAR, color = YEAR)) +
+  geom_line() +
+  facet_free(~OFFENSE_DESCRIPTION, scales = "free") +
+  ylab("Cases") +
+  guides(color = guide_legend(reverse = TRUE)) +
+  theme(legend.title = element_blank())
+  
+ggplotly(yty) %>%
+  layout(legend=list(traceorder='reversed'))
+```
+
+Many plots in different style about the top 5 most frequent crime in Boston.
+
+## VAR for top 5 crime
+### Step1 : Extract cases
+```{r extract cases}
+# extract top 5 crime
+top5crime <- boston %>%
+  filter(OFFENSE_DESCRIPTION %in% head(boston_summary$OFFENSE_DESCRIPTION, 5)) %>%
+  group_by(date, OFFENSE_DESCRIPTION) %>%
+  tally() %>%
+  spread(OFFENSE_DESCRIPTION, n)
+
+# rename columns
+colnames(top5crime) <- c("time",
+                         "investigate",
+                         "property damage",
+                         "medical",
+                         "vandalism",
+                         "dispute")
+
+# create date
+top5crime$time <- as.Date(top5crime$time,
+                          format = "%Y-%m-%d")
+# create time series
+top5crime_xts <- ts_xts(top5crime[,1:2])
+
+for (i in (3:ncol(top5crime))){
+  temp_xts <- ts_xts(top5crime[, c(1,i)])
+  top5crime_xts <- merge(top5crime_xts, temp_xts)
+}
+
+# extract difference, change per day
+top5crime_diff <- na.omit(diff(top5crime_xts))
+```
+### Step 2: Construct combined time series
+```{r top 5 crime VAR}
+# specify common time range
+# start from when covid was a thing
+# end with crime since it is manually updated
+common_time <- seq.Date(start(MA_res_ts), as.Date("2020-05-25"), by = "day")
+
+# combine time series of crime and covid
+combined_diff <- merge(top5crime_diff[paste(common_time[1],
+                                            common_time[length(common_time)],
+                                            sep = "/")],
+                       MA_res_ts[paste(common_time[1],
+                                            common_time[length(common_time)],
+                                            sep = "/")])
+
+```
+### Step 3: Plot each crime with covid
+```{r plot together}
+for (i in 1:(ncol(combined_diff) - 1)){
+  plotrix::twoord.plot(common_time,
+                       combined_diff[,i],
+                       common_time,
+                       combined_diff$residuals,
+                       type = c("l","l"),
+                       xaxt = "n",
+                       rylab = "number of daily fluctuation of covid 19 cases",
+                       ylab = paste("daily change in", colnames(combined_diff)[i]))
+                       
+}
+```
+
+Many look very promising
+
+### Step 5: Construct VAR model
+```{r construct var}
+# variable selection based on AIC
+optimal_investigate <- VARselect(combined_diff[,c(1,6)], type = 'none', lag.max = 10)
+optimal_damage <- VARselect(combined_diff[,c(2,6)], type = 'none', lag.max = 10)
+optimal_medical <- VARselect(combined_diff[,c(3,6)], type = 'none', lag.max = 10)
+optimal_vandalism <- VARselect(combined_diff[,c(4,6)], type = 'none', lag.max = 10)
+optimal_dispute <- VARselect(combined_diff[,c(5,6)], type = 'none', lag.max = 10)
+
+# construct the model based on smallest AIC
+VAR_investigate <- VAR(y=as.ts(combined_diff[,c(1,6)]), p=optimal_investigate$selection[1])
+VAR_damage <- VAR(y=as.ts(combined_diff[,c(2,6)]), p=optimal_damage$selection[1])
+VAR_medical <- VAR(y=as.ts(combined_diff[,c(3,6)]), p=optimal_medical$selection[1])
+VAR_vandalism <- VAR(y=as.ts(combined_diff[,c(4,6)]), p=optimal_vandalism$selection[1])
+VAR_dispute <- VAR(y=as.ts(combined_diff[,c(5,6)]), p=optimal_dispute$selection[1])
+```
+
+
+### Step 6: Granger Causality test
+#### Investigate Person
+```{r granger investigate}
+# investigate person
+causality(VAR_investigate, cause = colnames(combined_diff)[1])
+causality(VAR_investigate, cause = "residuals")
+```
+Nothing significant
+
+#### Property damange
+```{r granger property}
+# property damage
+causality(VAR_damage, cause = colnames(combined_diff)[2])
+causality(VAR_damage, cause = "residuals")
+```
+Nothing significant
+
+#### Medical attention
+```{r granger medical}
+# medical
+causality(VAR_medical, cause = colnames(combined_diff)[3])
+causality(VAR_medical, cause = "residuals")
+```
+Medical attention weakly significant both ways.
+
+#### Vandalism
+```{r granger vandalism}
+# vandalism
+causality(VAR_vandalism, cause = colnames(combined_diff)[4])
+causality(VAR_vandalism, cause = "residuals")
+```
+Vandalism significant to covid.
+
+#### Verbal dispute
+```{r granger dispute}
+# dispute
+causality(VAR_dispute, cause = colnames(combined_diff)[5])
+causality(VAR_dispute, cause = "residuals")
+
+```
+
+covid significant to verbal dispute.
+
+### Step 7: Impulse Response Function
+
+Only vandalism (from crime), and verbal dispute (from covid) are selected.
+
+```{r irf}
+lags = c(1:25)
+
+par(mfrow = c(1,2))
+# vandalism
+# from crime
+irf_vandalism_1 <- irf(VAR_vandalism,
+                     impulse = "vandalism",
+                     response = "residuals",
+                     n.ahead = 24)
+plot(irf_vandalism_1)
+
+# ggplot version
+irf_vandalism_1_gg <- data.frame(irf_vandalism_1$irf$vandalism[,1],
+                                 irf_vandalism_1$Lower$vandalism[,1],
+                                 irf_vandalism_1$Upper$vandalism[,1])
+
+colnames(irf_vandalism_1_gg) <- c("mean", "lower", "upper")
+
+i1 <- ggplot(irf_vandalism_1_gg, aes(x = lags)) +
+  geom_line(aes(y = mean), color = "black") +
+  geom_hline(yintercept = 0, color = "blue") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "lightblue", alpha = 0.5) +
+  theme_classic() +
+  ggtitle("How many more daily covid19 cases there will be 
+          after 1 vandalism") +
+  xlab("Number of days after a vandalism")+
+  ylab("Number of new covid 19 cases")
+
+ggplotly(i1)
+
+# verbal dispute
+# from covid
+irf_dispute_2 <- irf(VAR_dispute, 
+                         impulse = "residuals", 
+                         response = "dispute", 
+                         n.ahead = 24)
+plot(irf_dispute_2)
+
+# ggplot version
+irf_dispute_2_gg <- data.frame(irf_dispute_2$irf$residuals[,1],
+                               irf_dispute_2$Lower$residuals[,1],
+                               irf_dispute_2$Upper$residuals[,1])
+
+colnames(irf_dispute_2_gg) <- c("mean", "lower", "upper")
+
+i2 <- ggplot(irf_dispute_2_gg, aes(x=lags)) +
+  geom_line(aes(y = mean), color = "black") +
+  geom_hline(yintercept = 0, color = "blue") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "lightblue", alpha = 0.5) +
+  theme_classic() +
+  ggtitle("How many more verbal dispute cases per day there will be 
+          after 1 confirmed covid19 case") +
+  xlab("Number of days after a confimed covid 19 case")+
+  ylab("Number of verbal dispute cases")
+
+ggplotly(i2)
+```
+
+### Step 8: Forecast
+```{r custom function}
+interval_value_formatter <- "function(num, opts, seriesName, g, row, col) {
+  value = g.getValue(row, col);
+  if(value[0] != value[2]) {
+    lower = Dygraph.numberValueFormatter(value[0], opts);
+    upper = Dygraph.numberValueFormatter(value[2], opts);
+    return '[' + lower + ', ' + upper + ']';
+  } else {
+    return Dygraph.numberValueFormatter(num, opts);
+  }
+}"
+```
+
+```{r var forecast}
+# vandalism to covid
+# don't care about forecasting covid.
+# no html graph for this
+forecast_vandalism <- forecast(VAR_vandalism)
+
+autoplot(forecast_vandalism$forecast$residuals) +
+  ggtitle("Prediction on how many more covid19 cases
+          with the help of vandalism record") +
+  theme_classic() +
+  ylab("Daily additional confirmed number") +
+  xlab(paste("Number of days since", common_time[1]))
+
+# covid to verbal dispute
+forecast_dispute <- forecast(VAR_dispute)
+
+autoplot(forecast_dispute$forecast$dispute) +
+  ggtitle("Prediction on how many more verbal dispute cases compared to yesterday") +
+  theme_classic() +
+  ylab("Day-to-day change") +
+  xlab(paste("Number of days since", common_time[1]))
+
+# html version
+forecast_dispute$forecast$dispute %>%
+  {cbind(actuals = .$x, forecast_mean=.$mean,
+         lower_95=.$lower[,"95%"], upper_95=.$upper[,"95%"],
+         lower_80=.$lower[,"80%"], upper_80=.$upper[,"80%"])} %>%
+  dygraph(main = "Daily forecast for day-to-day change in verbal dispute in Boston",
+          ylab = "Day-to-day change") %>%
+  dyAxis("y", valueFormatter = interval_value_formatter) %>%
+  dySeries("actuals", color = "black") %>%
+  dySeries("forecast_mean", color = "blue", label = "forecast") %>%
+  dySeries(c("lower_80", "forecast_mean", "upper_80"),
+           label = "80%", color = "blue") %>%
+  dySeries(c("lower_95", "forecast_mean", "upper_95"),
+           label = "95%", color = "blue")%>%
+  dyLegend(labelsSeparateLines=TRUE) %>%
+  dyRangeSelector() %>%
+  dyAxis("x", label = paste("Numebr of days since", common_time[1])) %>%
+  dyLegend(show = "follow")
+
+# other crime, not significant
+# investigate eprson
+forecast_investigate <- forecast(VAR_investigate)
+
+forecast_investigate$forecast$investigate %>%
+  {cbind(actuals = .$x, forecast_mean=.$mean,
+         lower_95=.$lower[,"95%"], upper_95=.$upper[,"95%"],
+         lower_80=.$lower[,"80%"], upper_80=.$upper[,"80%"])} %>%
+  dygraph(main = "Daily forecast for day-to-day change in investigate person cases in Boston",
+          ylab = "Day-to-day change") %>%
+  dyAxis("y", valueFormatter = interval_value_formatter) %>%
+  dySeries("actuals", color = "black") %>%
+  dySeries("forecast_mean", color = "blue", label = "forecast") %>%
+  dySeries(c("lower_80", "forecast_mean", "upper_80"),
+           label = "80%", color = "blue") %>%
+  dySeries(c("lower_95", "forecast_mean", "upper_95"),
+           label = "95%", color = "blue")%>%
+  dyLegend(labelsSeparateLines=TRUE) %>%
+  dyRangeSelector() %>%
+  dyAxis("x", label = paste("Numebr of days since", common_time[1])) %>%
+  dyLegend(show = "follow")
+
+# property damage
+forecast_damage <- forecast(VAR_damage)
+
+forecast_damage$forecast$property.damage %>%
+  {cbind(actuals = .$x, forecast_mean=.$mean,
+         lower_95=.$lower[,"95%"], upper_95=.$upper[,"95%"],
+         lower_80=.$lower[,"80%"], upper_80=.$upper[,"80%"])} %>%
+  dygraph(main = "Daily forecast for day-to-day change in property damange cases in Boston",
+          ylab = "Day-to-day change") %>%
+  dyAxis("y", valueFormatter = interval_value_formatter) %>%
+  dySeries("actuals", color = "black") %>%
+  dySeries("forecast_mean", color = "blue", label = "forecast") %>%
+  dySeries(c("lower_80", "forecast_mean", "upper_80"),
+           label = "80%", color = "blue") %>%
+  dySeries(c("lower_95", "forecast_mean", "upper_95"),
+           label = "95%", color = "blue")%>%
+  dyLegend(labelsSeparateLines=TRUE) %>%
+  dyRangeSelector() %>%
+  dyAxis("x", label = paste("Numebr of days since", common_time[1])) %>%
+  dyLegend(show = "follow")
+
+# medical attention
+forecast_medical <- forecast(VAR_medical)
+
+forecast_medical$forecast$medical %>%
+  {cbind(actuals = .$x, forecast_mean=.$mean,
+         lower_95=.$lower[,"95%"], upper_95=.$upper[,"95%"],
+         lower_80=.$lower[,"80%"], upper_80=.$upper[,"80%"])} %>%
+  dygraph(main = "Daily forecast for day-to-day change in medical cases in Boston",
+          ylab = "Day-to-day change") %>%
+  dyAxis("y", valueFormatter = interval_value_formatter) %>%
+  dySeries("actuals", color = "black") %>%
+  dySeries("forecast_mean", color = "blue", label = "forecast") %>%
+  dySeries(c("lower_80", "forecast_mean", "upper_80"),
+           label = "80%", color = "blue") %>%
+  dySeries(c("lower_95", "forecast_mean", "upper_95"),
+           label = "95%", color = "blue")%>%
+  dyLegend(labelsSeparateLines=TRUE) %>%
+  dyRangeSelector() %>%
+  dyAxis("x", label = paste("Numebr of days since", common_time[1])) %>%
+  dyLegend(show = "follow")
+
+# vandalism
+forecast_vandalism$forecast$vandalism %>%
+  {cbind(actuals = .$x, forecast_mean=.$mean,
+         lower_95=.$lower[,"95%"], upper_95=.$upper[,"95%"],
+         lower_80=.$lower[,"80%"], upper_80=.$upper[,"80%"])} %>%
+  dygraph(main = "Daily forecast for day-to-day change in vandalism cases in Boston",
+          ylab = "Day-to-day change") %>%
+  dyAxis("y", valueFormatter = interval_value_formatter) %>%
+  dySeries("actuals", color = "black") %>%
+  dySeries("forecast_mean", color = "blue", label = "forecast") %>%
+  dySeries(c("lower_80", "forecast_mean", "upper_80"),
+           label = "80%", color = "blue") %>%
+  dySeries(c("lower_95", "forecast_mean", "upper_95"),
+           label = "95%", color = "blue")%>%
+  dyLegend(labelsSeparateLines=TRUE) %>%
+  dyRangeSelector() %>%
+  dyAxis("x", label = paste("Numebr of days since", common_time[1])) %>%
+  dyLegend(show = "follow")
+
+#### OPTIONAL
+accu_compare <- data.frame(rbind(accuracy(VAR_dispute$varresult[[1]]),
+                                 accuracy(VAR_investigate$varresult[[1]]),
+                                 accuracy(VAR_vandalism$varresult[[1]])))
+rownames(accu_compare) <- c('dispute', 'investigate', 'vandalism')
+kableExtra::kable(accu_compare, format = 'markdown')
+```
+### CONCLUSION
+Significant contribution on prediction:
+  Investigate person (week), verbal dispute
+
+Significant simultaneous movement:
+  Vandalism
+
+
+
+=== All followings are optional === 
+## Verbal Dispute
+### Summary with Visualization
+```{r verbal dispute summary}
+# extract verbal dispute cases
+dispute <- boston %>%
+  filter(OFFENSE_DESCRIPTION == "VERBAL DISPUTE") %>%
+  group_by(date) %>%
+  summarise(daily_freq = n())
+
+dispute_monthly <- boston %>%
+  # exclude May due to incomplete data
+  filter(OFFENSE_DESCRIPTION == "VERBAL DISPUTE",
+         y_month != "2020-05") %>%
+  group_by(y_month) %>%
+  summarise(monthly_freq = n())
+
+# change colname name for time series
+colnames(dispute)[1] <- "time"
+colnames(dispute_monthly)[1] <- "time"
+
+# convert to xts time series
+dispute_xts <- ts_xts(dispute)
+dispute_monthly_xts <- ts_xts(dispute_monthly)
+
+# plot overall monthly situation
+plot.xts(dispute_monthly_xts,
+         main = "Number of VERBAL DISPUTE cases 
+         per month in Boston")
+
+# plot daily situation since 2020
+plot.xts(dispute_xts["2020-01-01/"], 
+         main = "number of VERBAL DISPUTE cases 
+         per day in Boston since 2020")
+
+# year to year comparison
+boston %>%
+  filter(OFFENSE_DESCRIPTION == "VERBAL DISPUTE",
+         # filter out May 2020
+         y_month != "2020-05") %>%
+  count(YEAR, MONTH) %>%
+  ggplot(aes(x = as.factor(MONTH), y = n, group = YEAR, color = as_factor(YEAR))) +
+  geom_line() +
+  ggtitle("Year to Year comparison of 
+          daily verbal dispute frequency in Boston") +
+  theme_classic()
+```
+
+### Stationarity check
+```{r check stationarity and transform}
+adf.test(as.ts(dispute_xts))
+
+dispute_diff_xts <- na.omit(diff(dispute_xts))
+
+adf.test(as.ts(dispute_diff_xts))
+
+plot.xts(dispute_diff_xts["2020-01-01/"],
+         main = "The change in daily cases of
+         VERBAL DISPUTE in Boston")
+
+# since only the section after COVID 19 is related
+dispute_diff_xts <- dispute_diff_xts[paste(start(MA_res_ts),end(dispute_diff_xts), sep = "/")]
+```
+
+Raw data is not completely stationary in every AR(p) term but would be fine for most of the situation, but with a simple tranformation with its first difference, it rejects random walk null hypothesis and can be stationary in every AR(p) term, which improves our model flexibility, so the first difference would be used.
+
+### Univariate Model
+#### Simple AR model
+```{r univariate model}
+# plot ACF and PACF
+acf(as.ts(dispute_diff_xts))
+pacf(as.ts(dispute_diff_xts))
+
+# k = 3 for PACF
+dispute_ar <- arima(as.ts(dispute_diff_xts), order = c(3,0,0))
+dispute_ar
+
+# p = 10 for comparison against VAR
+dispute_ar_10 <- arima(as.ts(dispute_diff_xts), order = c(10,0,0))
+dispute_ar_10
+
+# auto arima model
+dispute_ar_auto <- forecast::auto.arima(as.ts(dispute_diff_xts))
+dispute_ar_auto
+
+# artificial neural network model
+dispute_ann <- nnetar(as.ts(dispute_diff_xts), size = 10)
+dispute_ann
+```
+Three univariate models have been constructed, which include:
+
+An AR(3) model based on the PACF plot.
+
+An AR(3) model based on the auto.arima algorithm.
+
+An artificial neural network that has 10 hidden nodes and has the form of a AR(3) and S-AR(10) on daily frequency.
+
+```{r in sample performance check}
+accu_ar <- accuracy(dispute_ar)
+accu_auto <- accuracy(dispute_ar_auto)
+accu_ann <- accuracy(dispute_ann)
+accu_ar10 <- accuracy(dispute_ar_10)
+
+accu_compare <- data.frame(rbind(accu_ar,
+                                 accu_auto,
+                                 accu_ann,
+                                 accu_ar10))
+
+rownames(accu_compare) <- c("AR(3)", "Auto ARIMA", "Neural Net","AR(10)")
+
+kableExtra::kable(accu_compare, format = "markdown")
+```
+
+Looks like artificial neural network is the best performing one out of all categories, with the smallest in-sample error.
+
+```{r univariate forecast}
+ar_forecast <- predict(dispute_ar, n.ahead = 24)
+auto_forecast <- predict(dispute_ar_auto, n.ahead = 24)
+ann_forecast <- predict(dispute_ann, h=24)
+dispute_ar_10_forecast <- predict(dispute_ar, n.ahead = 24)
+
+# plot forecast
+ts.plot(as.ts(dispute_diff_xts), ar_forecast$pred, 
+        auto_forecast$pred, ann_forecast$mean,
+        dispute_ar_10_forecast$pred,
+        gpars = list(col = c("black", "red","green","blue","purple")))
+
+```
+
+The forecast have been plotted above. All are very short memory, and couldn't predict the fluctuation well in long term.
+
+### Vector Auto-Regressive
+```{r overlap 2 time series}
+# combine 2 time series
+combined_diff <- merge(dispute_diff_xts[paste(start(MA_res_ts),end(dispute_diff_xts), sep = "/")],
+                  MA_res_ts[paste(start(MA_res_ts),end(dispute_diff_xts), sep = "/")])
+
+# range where covid and crime overlaps
+common_time <- seq.Date(as.Date(start(combined_diff)),
+                          as.Date(end(combined_diff)), 
+                          by="day")
+
+# examine two time series
+plotrix::twoord.plot(common_time, combined_diff$daily_freq,
+                     common_time, combined_diff$residuals,
+                     type = c("l","l"),
+                     main = "Daily number of verbal dispute cases 
+                     and number of confirmed cases daily in Boston",
+                     xaxt = "n",
+                     ylab = "number of verbal dispute cases",
+                     rylab = "number of daily fluctuation of covid 19 cases")
+```
+Possible for VAR
+
+```{r VAR}
+# VAR model estimation
+VAR_dispute <- vars::VAR(y=as.ts(na.omit(combined_diff)), p = 10)
+
+# Granger Causality test
+summary(VAR_dispute)
+causality(VAR_dispute, cause = "daily_freq")
+causality(VAR_dispute, cause = "residuals")
+# prediction advantage from covid to dispute is highly significant
+
+# Impulse Response Function
+irf1 <- irf(VAR_dispute, impulse = "daily_freq", response = "residuals", n.ahead = 24)
+plot(irf1, sub = "")
+
+irf2 <- irf(VAR_dispute, impulse = "residuals", response = "daily_freq", n.ahead = 24)
+plot(irf2, sub = "")
+
+# shock both significant at around 7 days later
+
+# obtain forecast
+VAR_dispute_forecast <- predict(VAR_dispute, n.ahead = 24)
+par(mai = c(0.4,0.4,0.5,0.1), cex.main = 0.8)
+plot(VAR_dispute_forecast)
+
+forecast(VAR_dispute) %>%
+  autoplot()
+
+```
+
+
+## Vandalism
+### Summary with Visualization
+```{r vandalism summary}
+# extract vandalism cases
+vandalism <- boston %>%
+  filter(OFFENSE_DESCRIPTION == "VANDALISM") %>%
+  group_by(date) %>%
+  summarise(daily_freq = n())
+
+vandalism_monthly <- boston %>%
+  # exclude May due to incomplete data
+  filter(OFFENSE_DESCRIPTION == "VANDALISM",
+         y_month != "2020-05") %>%
+  group_by(y_month) %>%
+  summarise(monthly_freq = n())
+
+# change colname for time series
+colnames(vandalism)[1] <- "time"
+colnames(vandalism_monthly)[1] <- "time"
+
+# convert to xts time series
+vandalism_xts <- ts_xts(vandalism)
+vandalism_monthly_xts <- ts_xts(vandalism_monthly)
+
+# plot overall monthly situation
+plot.xts(vandalism_monthly_xts,
+         main = "Number of VANDALISM cases 
+         per month in Boston")
+
+# plot daily situation since 2020
+plot.xts(vandalism_xts["2020-01-01/"], 
+         main = "number of VANDALISM cases 
+         per day in Boston since 2020")
+
+# year to year comparison
+boston %>%
+  filter(OFFENSE_DESCRIPTION == "VANDALISM",
+         # filter out May 2020
+         y_month != "2020-05") %>%
+  count(YEAR, MONTH) %>%
+  ggplot(aes(x = as.factor(MONTH), y = n, group = YEAR, color = as_factor(YEAR))) +
+  geom_line() +
+  ggtitle("Year to Year comparison of 
+          daily VANDALISM frequency in Boston") +
+  theme_classic()
+```
+
+Unusual spikes in March.
+
+### Stationarity check
+```{r vandalism stationarity check}
+adf.test(as.ts(vandalism_xts))
+
+vandalism_diff_xts <- na.omit(diff(vandalism_xts))
+
+adf.test(as.ts(vandalism_diff_xts))
+
+plot.xts(vandalism_diff_xts["2020-01-01/"],
+         main = "The change in daily cases of
+         VANDALISM in Boston")
+
+# since only the section after COVID 19 is related
+vandalism_diff_xts <- vandalism_diff_xts[paste(start(MA_res_ts),end(vandalism_diff_xts), sep = "/")]
+```
+
+Unsual spikes in March.
+
+### Vector Auto Regressive
+#### synced covid
+```{r overlap 2 time series}
+# combine 2 time series
+combined_vandalism_diff <- merge(vandalism_diff_xts[paste(start(MA_res_ts),end(vandalism_diff_xts), sep = "/")],
+                  MA_res_ts[paste(start(MA_res_ts),end(vandalism_diff_xts), sep = "/")])
+
+# range where covid and crime overlaps
+common_time <- seq.Date(as.Date(start(combined_vandalism_diff)),
+                          as.Date(end(combined_vandalism_diff)), 
+                          by="day")
+
+# examine two time series
+plotrix::twoord.plot(common_time, combined_vandalism_diff$daily_freq,
+                     common_time, combined_vandalism_diff$residuals,
+                     type = c("l","l"),
+                     main = "Daily number of vandalism cases 
+                     and number of confirmed cases daily in Boston",
+                     xaxt = "n",
+                     ylab = "number of vandalism cases",
+                     rylab = "number of daily fluctuation of covid 19 cases")
+```
+Almost perfect sync.
+
+VEC is probably not appropriate due to not having long-term relationship in nature, though linear model has a linear fit.
+
+```{r VAR vandalism}
+# VAR model estimation
+VAR_vandalism <- vars::VAR(y=as.ts(na.omit(combined_vandalism_diff)), p = 10)
+
+# Granger Causality test
+summary(VAR_vandalism)
+causality(VAR_vandalism, cause = "daily_freq")
+causality(VAR_vandalism, cause = "residuals")
+
+irf_vandalism1 <- irf(VAR_vandalism, impulse = "daily_freq", response = "residuals", n.ahead = 24)
+plot(irf_vandalism1, sub = "")
+
+irf_vandalism2 <- irf(VAR_vandalism, impulse = "residuals", response = "daily_freq", n.ahead = 24)
+plot(irf_vandalism2, sub = "")
+
+# tidy version of forecast
+forecast(VAR_vandalism) %>%
+  autoplot()
+
+# obtain forecast
+VAR_vandalism_forecast <- predict(VAR_vandalism, n.ahead = 24)
+par(mai = c(0.4,0.4,0.5,0.1), cex.main = 0.8)
+plot(VAR_vandalism_forecast)
+
+```
+
+Not much aside from proving that instantneous causality exists
+
+### Vector Error Correction
+```{r see long term relationship}
+combined_vandalism_diff %>%
+  ggplot(aes(x=residuals, y = daily_freq)) +
+  geom_smooth(method = "lm") +
+  geom_point()
+```
+Just some leverage points. cannot conclude long term linear relationship
